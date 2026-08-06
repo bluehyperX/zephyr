@@ -21,24 +21,29 @@ suspend where DDR enters self-refresh, A53 powers down, and an RTC alarm wakes i
 **Firmware call chain:**
 ```
 Zephyr pm_state_set(S2RAM)
+  → [SMP] CPU1 powers off via PSCI_CPU_OFF
+  → [SMP] CPU0 polls psci_affinity_info until CPU1 is OFF
   → arch_pm_s2ram_suspend(am62l_system_off)
     → saves x19–x30 on stack, SP + VBAR_EL1 to _cpu_context
-    → pm_s2ram_mark_set()
+    → pm_s2ram_mark_set()  (magic = 0xDABBAD00 in __noinit DDR)
     → am62l_system_off() → psci_system_suspend(virt_addr(arch_pm_s2ram_resume))
-      → SMC → TF-A EL3 → ti_sci_enter_sleep(am62l_sec_entrypoint)
-        → TIFS: DDR self-refresh, power down A53
+      → SMC → TF-A EL3 PSCI_SYSTEM_SUSPEND handler
+        → ti_sci_enter_sleep(am62l_sec_entrypoint) → TIFS
+          → DDR self-refresh, power down A53 cluster
 
 [RTC alarm fires]
 TIFS → TF-A am62l_sec_entrypoint (EL3)
+  → TF-A brings DDR out of self-refresh
   → TF-A restores GIC, IO isolation, EL1 system registers
   → ERET to EL1 at arch_pm_s2ram_resume
 
 arch_pm_s2ram_resume:
-  → pm_s2ram_mark_check_and_clear()  (magic = 0xDABBAD00 in __noinit DDR)
+  → pm_s2ram_mark_check_and_clear()  (checks magic, clears it)
   → restore VBAR_EL1 from _cpu_context
   → restore SP from _cpu_context
   → restore x19–x30 from stack (DDR preserved in self-refresh)
   → return x0=0 to arch_pm_s2ram_suspend call site
+  → [SMP] CPU0 cold-boots CPU1 via k_smp_cpu_resume → PSCI_CPU_ON
 ```
 
 ---
@@ -59,29 +64,16 @@ arch_pm_s2ram_resume:
 
 ## Component 1: PSCI `SYSTEM_SUSPEND` function
 
-**Files to modify:**
+**Status:** ✅ Already implemented in Zephyr upstream.
 
-`drivers/pm_cpu_ops/pm_cpu_ops_psci.h` — add to PSCI 1.0 block:
-```c
-#define PSCI_1_0_FN_SYSTEM_SUSPEND    PSCI_1_0_FN(14)
-#define PSCI_1_0_FN64_SYSTEM_SUSPEND  PSCI_1_0_FN64(14)
-```
-(Linux uses `PSCI_1_0` for SYSTEM_SUSPEND, not 1_1)
+The PSCI driver already provides `psci_system_suspend()`:
+- Function ID: `PSCI_1_0_FN64_SYSTEM_SUSPEND` (0xC400000E on 64-bit)
+- Takes only `entry_point` argument (no power state parameter)
+- TF-A selects the deepest system sleep mode automatically
 
-`drivers/pm_cpu_ops/pm_cpu_ops_psci.c` — add after `psci_cpu_suspend()`:
-```c
-int psci_system_suspend(uintptr_t entry_point)
-{
-    return psci_to_dev_err(
-        psci_data.invoke_psci_fn(
-            PSCI_FN_NATIVE(1_0, SYSTEM_SUSPEND), entry_point, 0, 0));
-}
-```
-
-`include/zephyr/drivers/pm_cpu_ops/psci.h` — add declaration:
-```c
-int psci_system_suspend(uintptr_t entry_point);
-```
+**Critical difference from CPU_SUSPEND:**
+- `psci_cpu_suspend(pstate, entry_point)` — per-CPU idle, does NOT trigger DDR self-refresh
+- `psci_system_suspend(entry_point)` — system-wide S2RAM, triggers DDR self-refresh + full SoC suspend
 
 ---
 
@@ -222,15 +214,53 @@ SECTION_FUNC(TEXT, arch_pm_s2ram_resume)
 
 ```c
 /* No DM: TF-A handles DDR self-refresh and LPM HAL entirely.
- * Zephyr only needs to save CPU context and call PSCI SYSTEM_SUSPEND. */
+ * Zephyr only needs to save CPU context and call PSCI SYSTEM_SUSPEND.
+ *
+ * S2RAM with SMP (CPU_OFF):
+ *   1. CPU0 signals CPU1 via SGI3 to power itself off (PSCI CPU_OFF).
+ *      TF-A sets aff_info_state = AFF_STATE_OFF on CPU_OFF, so
+ *      psci_affinity_info() works correctly here.
+ *   2. CPU0 polls psci_affinity_info until it returns non-zero (CPU1 off).
+ *   3. CPU0 calls arch_pm_s2ram_suspend() -> psci_system_suspend().
+ *   4. On resume CPU0 calls k_smp_cpu_resume(1, ...) which restarts CPU1
+ *      via pm_cpu_on, runs arch_secondary_cpu_init, reinits GIC and timer,
+ *      and rejoins the scheduler.
+ */
 
 #include <zephyr/pm/pm.h>
 #include <zephyr/arch/common/pm_s2ram.h>
 #include <zephyr/drivers/pm_cpu_ops/psci.h>
+#include <zephyr/drivers/pm_cpu_ops.h>
+#include <zephyr/drivers/interrupt_controller/gic.h>
+
+/* SGI3 is unallocated in smp.c (0=SCHED, 1=MMCFG, 2=FPU) */
+#define SGI_S2RAM_IPI           3
+#define CPU1_MPIDR              0x1ULL
+#define PSCI_AFF_STATE_ON       0
+#define PSCI_AFF_STATE_OFF      1
+
+#ifdef CONFIG_SMP
+static atomic_t s2ram_cpu1_req;
+
+static void am62l_s2ram_cpu1_ipi(const void *arg)
+{
+    ARG_UNUSED(arg);
+    if (atomic_get(&s2ram_cpu1_req)) {
+        (void)pm_cpu_off();
+        atomic_set(&s2ram_cpu1_req, 0);
+    }
+}
+
+void soc_per_core_init_hook(void)
+{
+    if (arch_curr_cpu()->id != 0U) {
+        irq_enable(SGI_S2RAM_IPI);
+    }
+}
+#endif
 
 static int am62l_system_off(void)
 {
-    /* Without MMU: virtual address == physical address */
     uintptr_t resume_pa = (uintptr_t)arch_pm_s2ram_resume;
     return psci_system_suspend(resume_pa);
 }
@@ -240,7 +270,18 @@ void pm_state_set(enum pm_state state, uint8_t substate_id)
     ARG_UNUSED(substate_id);
     switch (state) {
     case PM_STATE_SUSPEND_TO_RAM:
+#ifdef CONFIG_SMP
+        atomic_set(&s2ram_cpu1_req, 1);
+        gic_raise_sgi(SGI_S2RAM_IPI, CPU1_MPIDR, 1U << 1);
+        while (psci_affinity_info(CPU1_MPIDR, 0) == PSCI_AFF_STATE_ON) {
+            k_busy_wait(100);
+        }
+#endif
         arch_pm_s2ram_suspend(am62l_system_off);
+#ifdef CONFIG_SMP
+        atomic_set(&s2ram_cpu1_req, 0);
+        k_smp_cpu_resume(1, NULL, NULL, true, true);
+#endif
         break;
     case PM_STATE_SUSPEND_TO_IDLE:
     case PM_STATE_RUNTIME_IDLE:
@@ -257,11 +298,22 @@ void pm_state_exit_post_ops(enum pm_state state, uint8_t substate_id)
     ARG_UNUSED(substate_id);
     irq_unlock(0);
 }
+
+#ifdef CONFIG_SMP
+static int am62l_pm_init(void)
+{
+    IRQ_CONNECT(SGI_S2RAM_IPI, IRQ_DEFAULT_PRIORITY,
+                am62l_s2ram_cpu1_ipi, NULL, 0);
+    return 0;
+}
+SYS_INIT(am62l_pm_init, PRE_KERNEL_2, 0);
+#endif
 ```
 
 **File to modify:** `soc/ti/k3/am62lx/Kconfig` — add inside existing `config SOC_AM62L3`:
 ```kconfig
 select HAS_PM
+select SOC_PER_CORE_INIT_HOOK if PM_S2RAM && SMP
 ```
 
 ---
@@ -356,22 +408,36 @@ CONFIG_PM=y
 
 ## Implementation order
 
-| # | Work | Files | Risk |
-|---|------|-------|------|
-| 1 | PSCI SYSTEM_SUSPEND | `pm_cpu_ops_psci.h/.c`, `psci.h` | Low |
-| 2 | arm64 pm_s2ram.c (struct + marking) | `arch/arm64/core/pm_s2ram.c` | Low |
-| 3 | arm64 pm_s2ram.S (suspend path) | `arch/arm64/core/pm_s2ram.S` | Medium |
-| 4 | arm64 pm_s2ram.S (resume trampoline) | `arch/arm64/core/pm_s2ram.S` | Medium |
-| 5 | Kconfig + CMakeLists wiring | `arch/Kconfig`, `arch/arm64/core/CMakeLists.txt` | Low |
-| 6 | AM62L power.c + Kconfig | `soc/ti/k3/am62lx/power.c`, `Kconfig` | Low |
-| 7 | RTC binding alias + DTS node | `ti,am62l-rtc.yaml`, `am62l-wakeup.dtsi`, board DTS | Low |
-| 8 | Board power-states + defconfig | `am62l3_a53.dtsi`, `defconfig` | Low |
+| # | Work | Files | Status |
+|---|------|-------|--------|
+| 1 | PSCI SYSTEM_SUSPEND | `pm_cpu_ops_psci.h/.c`, `psci.h` | ✅ Already in upstream |
+| 2 | arm64 pm_s2ram.c (struct + marking) | `arch/arm64/core/pm_s2ram.c` | ✅ Implemented |
+| 3 | arm64 pm_s2ram.S (suspend path) | `arch/arm64/core/pm_s2ram.S` | ✅ Implemented |
+| 4 | arm64 pm_s2ram.S (resume trampoline) | `arch/arm64/core/pm_s2ram.S` | ✅ Implemented |
+| 5 | Kconfig + CMakeLists wiring | `arch/Kconfig`, `arch/arm64/core/CMakeLists.txt` | ✅ Implemented |
+| 6 | AM62L power.c + Kconfig | `soc/ti/k3/am62lx/power.c`, `Kconfig` | ✅ Implemented (uses `psci_system_suspend`) |
+| 7 | RTC binding alias + DTS node | `ti,am62l-rtc.yaml`, `am62l-wakeup.dtsi`, board DTS | ✅ Implemented |
+| 8 | Board power-states + defconfig | `am62l3_a53.dtsi`, `defconfig` | ✅ Implemented |
+| 9 | LPM sample application | `samples/boards/ti/am62l_lpm/` | ✅ Implemented |
 
 ---
 
-## Remaining open question
+## Implementation Status
 
-**Stack direction alignment in resume trampoline:** The suspend path pushes pairs
-with `[sp, #-16]!` (descending). The resume path pops with `[sp], #16` (ascending).
-Verify at implementation time that the `stp` push order and `ldp` pop order match
-(x29/x30 pushed last, popped first).
+**✅ All components implemented and building successfully.**
+
+### Known Testing Gaps
+
+1. **Hardware validation:** Code compiles but needs testing on actual AM62L EVM hardware with:
+   - RTC wakeup alarm triggering resume
+   - DDR self-refresh preserving data across suspend
+   - I2C EEPROM read/write verification (PM_DEVICE_ACTION_TURN_ON/OFF)
+   - CPU1 SMP resume via PSCI_CPU_ON
+
+2. **TF-A integration:** Verify TF-A `psci_system_suspend()` handler:
+   - Calls `ti_sci_enter_sleep()` to signal TIFS
+   - Puts DDR into self-refresh
+   - Powers down A53 cluster
+   - On RTC wakeup, brings DDR out of self-refresh and resumes at `entry_point`
+
+3. **Suspend marker validation:** Verify `0xDABBAD00` magic survives DDR self-refresh in `__noinit` section.
