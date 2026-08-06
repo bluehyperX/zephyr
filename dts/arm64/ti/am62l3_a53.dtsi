@@ -25,12 +25,23 @@
 			device_type = "cpu";
 			compatible = "arm,cortex-a53";
 			reg = <0>;
+			cpu-power-states = <&rtc_ddr>;
 		};
 
 		cpu@1 {
 			device_type = "cpu";
 			compatible = "arm,cortex-a53";
 			reg = <1>;
+			cpu-power-states = <&rtc_ddr>;
+		};
+	};
+
+	power-states {
+		rtc_ddr: rtc-ddr {
+			compatible = "zephyr,power-state";
+			power-state-name = "suspend-to-ram";
+			min-residency-us = <1000000>;
+			exit-latency-us = <600000>;
 		};
 	};
 
@@ -239,5 +250,10 @@
 
 &main_ecap2 {
 	interrupts = <GIC_SPI 156 IRQ_TYPE_EDGE IRQ_DEFAULT_PRIORITY>;
+	interrupt-parent = <&gic>;
+};
+
+&wkup_rtc0 {
+	interrupts = <GIC_SPI 28 IRQ_TYPE_LEVEL IRQ_DEFAULT_PRIORITY>;
 	interrupt-parent = <&gic>;
 };

@@ -13,6 +13,7 @@
 #include <zephyr/irq.h>
 #include <zephyr/drivers/i2c.h>
 #include <zephyr/drivers/pinctrl.h>
+#include <zephyr/pm/device.h>
 #include <zephyr/sys/util.h>
 
 #ifdef CONFIG_I2C_OMAP_BUS_RECOVERY
@@ -710,6 +711,29 @@ static int i2c_omap_init(const struct device *dev)
 	return 0;
 }
 
+static int i2c_omap_pm_action(const struct device *dev, enum pm_device_action action)
+{
+	const struct i2c_omap_cfg *cfg = DEV_CFG(dev);
+
+	switch (action) {
+	case PM_DEVICE_ACTION_TURN_ON:
+		/* Re-program hardware registers lost when I2C power domain cycled.
+		 * MMIO mapping and semaphore survive DDR self-refresh; skip them. */
+		if (i2c_omap_set_speed(dev, cfg->speed)) {
+			return -ENOTSUP;
+		}
+		i2c_omap_init_ll(dev);
+		break;
+	case PM_DEVICE_ACTION_TURN_OFF:
+	case PM_DEVICE_ACTION_SUSPEND:
+	case PM_DEVICE_ACTION_RESUME:
+		break;
+	default:
+		return -ENOTSUP;
+	}
+	return 0;
+}
+
 #define I2C_OMAP_INIT(inst)                                                                        \
 	PINCTRL_DT_INST_DEFINE(inst);                                                              \
 	LOG_INSTANCE_REGISTER(omap_i2c, inst, CONFIG_I2C_LOG_LEVEL);                               \
@@ -722,9 +746,11 @@ static int i2c_omap_init(const struct device *dev)
                                                                                                    \
 	static struct i2c_omap_data i2c_omap_data_##inst;                                          \
                                                                                                    \
+	PM_DEVICE_DT_INST_DEFINE(inst, i2c_omap_pm_action);                                        \
+                                                                                                   \
 	I2C_DEVICE_DT_INST_DEFINE(inst,                                                            \
 		i2c_omap_init,                                                                     \
-		NULL,                                                                              \
+		PM_DEVICE_DT_INST_GET(inst),                                                       \
 		&i2c_omap_data_##inst,                                                             \
 		&i2c_omap_cfg_##inst,                                                              \
 		POST_KERNEL,                                                                       \

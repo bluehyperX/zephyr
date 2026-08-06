@@ -58,6 +58,20 @@ typedef int (*pm_s2ram_system_off_fn_t)(void);
 int arch_pm_s2ram_suspend(pm_s2ram_system_off_fn_t system_off);
 
 /**
+ * @brief Resume entry point after suspend-to-RAM.
+ *
+ * This function is the arch-provided resume entry point.  It is passed as the
+ * @p entry_point argument to the PSCI SYSTEM_SUSPEND call (or equivalent) so
+ * that firmware can branch back to the kernel after the system wakes up.
+ *
+ * On entry, TF-A (or equivalent firmware) has already restored EL1 system
+ * registers.  The function restores the CPU context saved by
+ * @ref arch_pm_s2ram_suspend and returns to the @ref arch_pm_s2ram_suspend
+ * call site with a return value of 0.
+ */
+void arch_pm_s2ram_resume(void);
+
+/**
  * @brief Mark that core is entering suspend-to-RAM state.
  *
  * Function is called when system state is stored to RAM, just before going to system

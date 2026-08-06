@@ -7,3 +7,22 @@ config SOC_SERIES_AM62LX_A53
 	select CPU_CORTEX_A53
 	select ARM_ARCH_TIMER if SYS_CLOCK_EXISTS
 	select SOC_EARLY_INIT_HOOK
+	select HAS_PM
+	select SOC_PER_CORE_INIT_HOOK if PM_S2RAM && SMP
+
+config SOC_AM62L_S2RAM_CPU1_SUSPEND
+	bool "Use PSCI CPU_SUSPEND for CPU1 during S2RAM (instead of CPU_OFF)"
+	depends on PM_S2RAM && SMP
+	default n
+	help
+	  When disabled (default), CPU1 is powered off via PSCI CPU_OFF before
+	  CPU0 enters deep sleep. TF-A sets aff_info_state = AFF_STATE_OFF on
+	  CPU_OFF, allowing CPU0 to use psci_affinity_info() to detect when
+	  CPU1 is gone. On resume, k_smp_cpu_resume() brings CPU1 back up via
+	  the standard PSCI CPU_ON / SMP boot path. This matches the approach
+	  used by the Linux kernel on AM62L.
+
+	  When enabled, CPU1 enters PSCI CPU_SUSPEND (LPM_PSTATE_SEC) and TF-A
+	  holds it in an EL3 WFI. On resume a SGI3 releases CPU1 from TF-A,
+	  which ERets to the am62l_cpu1_resume trampoline to restore context.
+	  This path keeps power_smp.S in the build.

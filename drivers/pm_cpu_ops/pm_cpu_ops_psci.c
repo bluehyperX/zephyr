@@ -84,6 +84,22 @@ int psci_cpu_suspend(uint32_t state, uintptr_t entry_point)
 	return psci_to_dev_err(ret);
 }
 
+int psci_system_suspend(uintptr_t entry_point)
+{
+	int ret;
+
+	ret = psci_data.invoke_psci_fn(PSCI_FN_NATIVE(1_0, SYSTEM_SUSPEND),
+					entry_point, 0, 0);
+
+	return psci_to_dev_err(ret);
+}
+
+int psci_affinity_info(uintptr_t target_affinity, uint32_t lowest_affinity_level)
+{
+	return (int)psci_data.invoke_psci_fn(PSCI_FN_NATIVE(0_2, AFFINITY_INFO),
+					     target_affinity, lowest_affinity_level, 0);
+}
+
 #ifdef CONFIG_POWEROFF
 void z_sys_poweroff(void)
 {

@@ -6,6 +6,16 @@ zephyr_sources(peripherals/ctrl_partitions.c)
 
 if(CONFIG_SOC_SERIES_AM62X_A53 OR CONFIG_SOC_SERIES_AM62LX_A53)
   zephyr_sources(cortex_a/soc.c)
+endif()
+
+if(CONFIG_SOC_SERIES_AM62LX_A53 AND CONFIG_PM_S2RAM)
+  zephyr_sources(${ZEPHYR_BASE}/soc/ti/k3/am62lx/power.c)
+  if(CONFIG_SMP AND CONFIG_SOC_AM62L_S2RAM_CPU1_SUSPEND)
+    zephyr_sources(${ZEPHYR_BASE}/soc/ti/k3/am62lx/power_smp.S)
+  endif()
+endif()
+
+if(CONFIG_SOC_SERIES_AM62X_A53 OR CONFIG_SOC_SERIES_AM62LX_A53)
 
   set(SOC_LINKER_SCRIPT ${ZEPHYR_BASE}/include/zephyr/arch/arm64/scripts/linker.ld CACHE INTERNAL "")
 elseif(CONFIG_SOC_SERIES_AM62X_M4 OR CONFIG_SOC_SERIES_AM64X_M4)

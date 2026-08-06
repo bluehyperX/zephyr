@@ -22,34 +22,45 @@ static int scmi_pd_pm_action(const struct device *dev,
 			      enum pm_device_action action)
 {
 	const struct scmi_pd_config *cfg = dev->config;
-	struct scmi_power_state_config pwr_cfg;
-	int ret;
 
-	LOG_INF("attempting PM action %d on domain %d", action, cfg->domain_id);
+	LOG_DBG("attempting PM action %d on domain %d", action, cfg->domain_id);
 
 	switch (action) {
 	case PM_DEVICE_ACTION_RESUME:
-		pwr_cfg.domain_id = cfg->domain_id;
-		pwr_cfg.flags = 0;
-		pwr_cfg.power_state = SCMI_POWER_STATE_GENERIC_ON;
+#ifndef CONFIG_POWER_DOMAIN_ARM_SCMI_LPM_MANAGED
+		{
+			struct scmi_power_state_config pwr_cfg;
+			int ret;
 
-		ret = scmi_power_state_set(&pwr_cfg);
-		if (ret < 0) {
-			return ret;
+			pwr_cfg.domain_id = cfg->domain_id;
+			pwr_cfg.flags = 0;
+			pwr_cfg.power_state = SCMI_POWER_STATE_GENERIC_ON;
+
+			ret = scmi_power_state_set(&pwr_cfg);
+			if (ret < 0) {
+				return ret;
+			}
 		}
+#endif
 		pm_device_children_action_run(dev, PM_DEVICE_ACTION_TURN_ON, NULL);
 		break;
 	case PM_DEVICE_ACTION_SUSPEND:
 		pm_device_children_action_run(dev, PM_DEVICE_ACTION_TURN_OFF, NULL);
+#ifndef CONFIG_POWER_DOMAIN_ARM_SCMI_LPM_MANAGED
+		{
+			struct scmi_power_state_config pwr_cfg;
+			int ret;
 
-		pwr_cfg.domain_id = cfg->domain_id;
-		pwr_cfg.flags = 0;
-		pwr_cfg.power_state = SCMI_POWER_STATE_GENERIC_OFF;
+			pwr_cfg.domain_id = cfg->domain_id;
+			pwr_cfg.flags = 0;
+			pwr_cfg.power_state = SCMI_POWER_STATE_GENERIC_OFF;
 
-		ret = scmi_power_state_set(&pwr_cfg);
-		if (ret < 0) {
-			return ret;
+			ret = scmi_power_state_set(&pwr_cfg);
+			if (ret < 0) {
+				return ret;
+			}
 		}
+#endif
 		break;
 	case PM_DEVICE_ACTION_TURN_ON:
 		break;

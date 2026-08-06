@@ -1,0 +1,14 @@
+sample:
+  name: AM62L Suspend-to-RAM (S2RAM) Low Power Mode Demo
+tests:
+  sample.boards.ti.am62l_lpm:
+    platform_allow:
+      - am62l_evm/am62l3/a53
+    tags:
+      - pm
+      - s2ram
+    harness: console
+    harness_config:
+      type: one_line
+      regex:
+        - "AM62L S2RAM demo"

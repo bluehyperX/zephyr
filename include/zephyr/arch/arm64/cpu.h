@@ -261,4 +261,27 @@
 
 /** @endcond */
 
+#ifdef CONFIG_PM_S2RAM
+
+#ifndef _ASMLANGUAGE
+
+/*
+ * CPU context for S2RAM on arm64.
+ * TF-A restores all EL1 system registers (SCTLR_EL1, TCR_EL1, CPACR_EL1,
+ * MAIR_EL1, page-table regs) via cm_el1_sysregs_context_restore() before
+ * branching to EL1.  Zephyr only needs to save what TF-A does not: the stack
+ * pointer (TF-A has no knowledge of the Zephyr stack) and VBAR_EL1
+ * (defensive, in case of older TF-A).  GPRs are saved on the stack.
+ */
+struct __cpu_context {
+	uint64_t sp;
+	uint64_t vbar_el1;
+};
+
+typedef struct __cpu_context _cpu_context_t;
+
+#endif /* _ASMLANGUAGE */
+
+#endif /* CONFIG_PM_S2RAM */
+
 #endif /* ZEPHYR_INCLUDE_ARCH_ARM64_CPU_H_ */

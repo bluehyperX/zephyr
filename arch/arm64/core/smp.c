@@ -90,47 +90,65 @@ void arch_cpu_start(int cpu_num, k_thread_stack_t *stack, int sz,
 	arm64_cpu_boot_params.arg = arg;
 	arm64_cpu_boot_params.cpu_num = cpu_num;
 
-	for (; i < cpu_count; i++) {
-		if (cpu_node_list[i] == primary_core_mpid) {
-			continue;
-		}
-
-		cpu_mpid = cpu_node_list[i];
-
+	/*
+	 * Resume path: the MPID is already in cpu_map from the initial boot.
+	 * Skip the cpu_node_list scan — the static iterator 'i' would be
+	 * exhausted and k_panic() would fire.  DDR is retained across S2RAM
+	 * so sp/cpu_num are still valid; only fn/arg were repopulated above.
+	 */
+	if (cpu_map[cpu_num] != INV_MPID) {
+		cpu_mpid = cpu_map[cpu_num];
 		barrier_dsync_fence_full();
-
-		/* store mpid last as this is our synchronization point */
 		arm64_cpu_boot_params.mpid = cpu_mpid;
-
 		sys_cache_data_flush_range((void *)&arm64_cpu_boot_params,
-					  sizeof(arm64_cpu_boot_params));
-
+					   sizeof(arm64_cpu_boot_params));
 		if (pm_cpu_on(cpu_mpid, (uint64_t)&__start)) {
-			printk("Failed to boot secondary CPU core %d (MPID:%#llx)\n",
+			printk("Failed to resume secondary CPU core %d (MPID:%#llx)\n",
 			       cpu_num, cpu_mpid);
-#ifdef CONFIG_ARM64_FALLBACK_ON_RESERVED_CORES
-			printk("Falling back on reserved cores\n");
-			continue;
-#else
 			k_panic();
+		}
+	} else {
+		for (; i < cpu_count; i++) {
+			if (cpu_node_list[i] == primary_core_mpid) {
+				continue;
+			}
+
+			cpu_mpid = cpu_node_list[i];
+
+			barrier_dsync_fence_full();
+
+			/* store mpid last as this is our synchronization point */
+			arm64_cpu_boot_params.mpid = cpu_mpid;
+
+			sys_cache_data_flush_range((void *)&arm64_cpu_boot_params,
+						   sizeof(arm64_cpu_boot_params));
+
+			if (pm_cpu_on(cpu_mpid, (uint64_t)&__start)) {
+				printk("Failed to boot secondary CPU core %d (MPID:%#llx)\n",
+				       cpu_num, cpu_mpid);
+#ifdef CONFIG_ARM64_FALLBACK_ON_RESERVED_CORES
+				printk("Falling back on reserved cores\n");
+				continue;
+#else
+				k_panic();
 #endif
+			}
+
+			break;
+		}
+		if (i++ == cpu_count) {
+			printk("Can't find CPU Core %d from dts and failed to boot it\n", cpu_num);
+			k_panic();
 		}
 
-		break;
-	}
-	if (i++ == cpu_count) {
-		printk("Can't find CPU Core %d from dts and failed to boot it\n", cpu_num);
-		k_panic();
+		cpu_map[cpu_num] = cpu_mpid;
+		printk("Secondary CPU core %d (MPID:%#llx) is up\n", cpu_num, cpu_mpid);
 	}
 
-	/* Wait secondary cores up, see arch_secondary_cpu_init */
+	/* Wait secondary core up, see arch_secondary_cpu_init */
 	while (arm64_cpu_boot_params.fn) {
 		wfe();
 	}
-
-	cpu_map[cpu_num] = cpu_mpid;
-
-	printk("Secondary CPU core %d (MPID:%#llx) is up\n", cpu_num, cpu_mpid);
 }
 
 /* the C entry of secondary cores */

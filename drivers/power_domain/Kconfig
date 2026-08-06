@@ -146,6 +146,20 @@ config POWER_DOMAIN_ARM_SCMI_INIT_PRIORITY
 	help
 	  ARM SCMI PD driver initialization priority.
 
+config POWER_DOMAIN_ARM_SCMI_LPM_MANAGED
+	bool "Platform firmware owns SCMI domain state during system suspend"
+	help
+	  When enabled, the SCMI power domain driver does not issue
+	  SCMI power-state requests during PM_DEVICE_ACTION_SUSPEND or
+	  PM_DEVICE_ACTION_RESUME.  Child devices still receive TURN_OFF
+	  and TURN_ON actions so they can save and restore register state.
+
+	  Select this on platforms where platform firmware (e.g. TF-A via
+	  TIFS on TI K3) controls the individual SCMI power domains as part
+	  of the system LPM entry and exit sequence.  Issuing redundant
+	  SCMI power-off calls from Zephyr before psci_cpu_suspend()
+	  conflicts with the firmware LPM HAL and causes a hard reset.
+
 endif #POWER_DOMAIN_ARM_SCMI
 
 # zephyr-keep-sorted-start

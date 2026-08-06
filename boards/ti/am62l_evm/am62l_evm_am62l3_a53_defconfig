@@ -38,3 +38,13 @@ CONFIG_CLOCK_CONTROL=y
 # Power Domain
 CONFIG_PM_DEVICE=y
 CONFIG_POWER_DOMAIN=y
+# TF-A via TIFS controls SCMI domain state during LPM; skip Zephyr-driven
+# SCMI power-off/on calls in pm_suspend_devices()/pm_resume_devices().
+CONFIG_POWER_DOMAIN_ARM_SCMI_LPM_MANAGED=y
+
+# Power Management
+CONFIG_PM=y
+CONFIG_PM_DEVICE_SYSTEM_MANAGED=y
+
+# Counter (for RTC wakeup alarm)
+CONFIG_COUNTER=y
