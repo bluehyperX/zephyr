@@ -36,7 +36,7 @@
 
 LOG_MODULE_REGISTER(am62l_lpm, LOG_LEVEL_INF);
 
-#define WAKE_DELAY_S    5U
+#define WAKE_DELAY_S    20U
 #define EEPROM_OFFSET   0U
 #define EEPROM_LEN      3U
 
@@ -147,6 +147,8 @@ int main(void)
 	pm_policy_state_lock_get(PM_STATE_RUNTIME_IDLE, PM_ALL_SUBSTATES);
 	pm_policy_state_lock_get(PM_STATE_SUSPEND_TO_IDLE, PM_ALL_SUBSTATES);
 	pm_policy_state_lock_get(PM_STATE_SUSPEND_TO_RAM, PM_ALL_SUBSTATES);
+
+	// k_msleep(WAKE_DELAY_S * MSEC_PER_SEC);
 
 	LOG_INF("AM62L S2RAM demo — RTC wakeup, I2C verify");
 	LOG_INF("DDR-retained cycle counter at boot: %u", cycles);
