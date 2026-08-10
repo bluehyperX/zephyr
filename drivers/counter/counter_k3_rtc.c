@@ -12,6 +12,7 @@
 #include <zephyr/irq.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/pm/device.h>
 
 LOG_MODULE_REGISTER(counter_ti_k3_rtc, CONFIG_COUNTER_LOG_LEVEL);
 
@@ -24,11 +25,17 @@ LOG_MODULE_REGISTER(counter_ti_k3_rtc, CONFIG_COUNTER_LOG_LEVEL);
 #define RTC_CNT_FMODE_MASK		BIT(25)
 #define RTC_UNLOCK_MASK			BIT(23)
 #define RTC_O32K_OSC_MASK		BIT(21)
+#define RTC_GEN_PWR_OFF_MASK	BIT(16)   /* General Control[16]: Power-off enable */
+#define RTC_GEN_SW_OFF_MASK		BIT(17)   /* General Control[17]: Software power off */
+#define RTC_WKUP_EN_MASK		0xF       /* General Control[3:0]: Wakeup enable */
+#define RTC_WRT_ERR_MASK		BIT(3)    /* Sync Pending[3]: Write error */
+#define RTC_RELOAD_FROM_BBD		BIT(31)   /* Sync Pending[31]: Reload from battery-backed domain */
 #define RTC_SYNCPEND_STATUS_MASK	BIT_MASK(2)
 
 #define RTC_IRQ_ALARM1_MASK		BIT(0)
 #define RTC_IRQ_ALARM2_MASK		BIT(1)
 #define RTC_IRQ_STATUS_MASK		BIT_MASK(2)
+#define RTC_IRQ_STATUS_ALL_MASK		BIT_MASK(6)  /* All IRQ bits [5:0]: alarms + GPIO wakeups */
 
 #define DEV_CFG(dev)  ((const struct k3_rtc_counter_cfg *)(dev)->config)
 #define DEV_DATA(dev) ((struct k3_rtc_counter_data *)(dev)->data)
@@ -48,7 +55,7 @@ typedef struct {
 	volatile uint32_t DEBOUNCE;		/* Debounce - 28h */
 	volatile uint32_t ANALOG;		/* AnalogCfg - 2Ch */
 	volatile uint32_t SCRATCH[8];		/* Scratch Storage X - 30h */
-	volatile uint32_t GENRAL_CTL;		/* GeneralControl - 50h */
+	volatile uint32_t GENERAL_CTL;		/* GeneralControl - 50h */
 	volatile uint32_t IRQSTATUS_RAW_SYS;	/* Interrupt Raw Status Register - 54h */
 	volatile uint32_t IRQSTATUS_SYS;	/* Interrupt Status Register - 58h */
 	volatile uint32_t IRQENABLE_SET_SYS;	/* Interrupt Enable Set Register - 5Ch */
@@ -96,7 +103,7 @@ static int k3_rtc_fence(const struct device *dev)
 
 static int k3_rtc_unlock_status(k3_rtc_regs_t *rtc_regs)
 {
-	return !!(rtc_regs->GENRAL_CTL & RTC_UNLOCK_MASK);
+	return !!(rtc_regs->GENERAL_CTL & RTC_UNLOCK_MASK);
 }
 
 static int k3_rtc_unlock(const struct device *dev)
@@ -118,6 +125,25 @@ static int k3_rtc_unlock(const struct device *dev)
 			LOG_ERR("RTC unlock failed!");
 			return -EIO;
 		}
+	}
+
+	return 0;
+}
+
+static int k3_rtc_lock(const struct device *dev)
+{
+	k3_rtc_regs_t *rtc_regs = DEV_REGS(dev);
+	struct k3_rtc_counter_data *data = DEV_DATA(dev);
+	int ret;
+
+	rtc_regs->KICK0 = 0x0;
+
+	ret = WAIT_FOR(k3_rtc_unlock_status(rtc_regs) == 0,
+		       data->sync_timeout_us,
+		       k_busy_wait(1));
+	if (ret != 0) {
+		LOG_ERR("RTC lock failed!");
+		return -EIO;
 	}
 
 	return 0;
@@ -433,6 +459,164 @@ static void k3_rtc_isr(const struct device *dev)
 	}
 }
 
+#ifdef CONFIG_PM_DEVICE
+static int k3_rtc_pm_action(const struct device *dev, enum pm_device_action action)
+{
+	k3_rtc_regs_t *rtc_regs = DEV_REGS(dev);
+	uint32_t intr_src;
+	int ret;
+
+	switch (action) {
+	case PM_DEVICE_ACTION_SUSPEND:
+		ret = k3_rtc_unlock(dev);
+		if (ret != 0) {
+			return ret;
+		}
+
+		/* Enable PMIC power-off signal */
+		rtc_regs->GENERAL_CTL |= RTC_GEN_PWR_OFF_MASK;
+
+		ret = k3_rtc_fence(dev);
+		if (ret != 0) {
+			LOG_ERR("Failed to fence PWR_OFF: %d", ret);
+			return ret;
+		}
+
+		ret = k3_rtc_lock(dev);
+		if (ret != 0) {
+			return ret;
+		}
+
+		ret = k3_rtc_unlock(dev);
+		if (ret != 0) {
+			return ret;
+		}
+
+		/* Enable software poweroff */
+		rtc_regs->GENERAL_CTL |= RTC_GEN_SW_OFF_MASK;
+
+		ret = k3_rtc_fence(dev);
+		if (ret != 0) {
+			LOG_ERR("Failed to fence SW_OFF: %d", ret);
+			return ret;
+		}
+
+		return 0;
+
+	case PM_DEVICE_ACTION_RESUME:
+		/*
+		 * Check if RTC retained power. PWR_OFF set means the RTC kept
+		 * context across suspend (S2RAM), so we need to clean up the
+		 * poweroff configuration. If not set, RTC lost context and
+		 * k3_counter_init() will reconfigure it.
+		 */
+		if (!(rtc_regs->GENERAL_CTL & RTC_GEN_PWR_OFF_MASK)) {
+			return 0;
+		}
+
+		/*
+		 * Explicitly clear SW_OFF bit first - forced write required.
+		 * This must be done before any lock/unlock cycle to de-arm
+		 * the poweroff state.
+		 */
+		rtc_regs->GENERAL_CTL &= ~RTC_GEN_SW_OFF_MASK;
+
+		ret = k3_rtc_fence(dev);
+		if (ret != 0) {
+			LOG_ERR("Failed to fence SW_OFF clear: %d", ret);
+			return ret;
+		}
+
+		ret = k3_rtc_lock(dev);
+		if (ret != 0) {
+			return ret;
+		}
+
+		ret = k3_rtc_unlock(dev);
+		if (ret != 0) {
+			return ret;
+		}
+
+		/* Clear write error condition */
+		rtc_regs->SYNCPEND = RTC_WRT_ERR_MASK;
+
+		/* Disable all IRQs: alarm1, alarm2, and GPIO wakeup [5:0] */
+		rtc_regs->IRQENABLE_CLR_SYS = RTC_IRQ_STATUS_ALL_MASK;
+
+		ret = k3_rtc_lock(dev);
+		if (ret != 0) {
+			return ret;
+		}
+
+		ret = k3_rtc_fence(dev);
+		if (ret != 0) {
+			LOG_ERR("Failed to fence IRQ disable: %d", ret);
+			return ret;
+		}
+
+		ret = k3_rtc_unlock(dev);
+		if (ret != 0) {
+			return ret;
+		}
+
+		/* Clear all wakeup enable bits [3:0] */
+		rtc_regs->GENERAL_CTL &= ~RTC_WKUP_EN_MASK;
+
+		ret = k3_rtc_lock(dev);
+		if (ret != 0) {
+			return ret;
+		}
+
+		ret = k3_rtc_unlock(dev);
+		if (ret != 0) {
+			return ret;
+		}
+
+		/*
+		 * Read raw IRQ status and clear it. Cannot use a read-modify-
+		 * write due to a potential race between the 32k and vbus domains.
+		 */
+		intr_src = rtc_regs->IRQSTATUS_RAW_SYS & RTC_IRQ_STATUS_ALL_MASK;
+		rtc_regs->IRQSTATUS_SYS = intr_src;
+
+		/* Clear power-off enable that was set during suspend */
+		rtc_regs->GENERAL_CTL &= ~RTC_GEN_PWR_OFF_MASK;
+
+		ret = k3_rtc_lock(dev);
+		if (ret != 0) {
+			return ret;
+		}
+
+		ret = k3_rtc_unlock(dev);
+		if (ret != 0) {
+			return ret;
+		}
+
+		/*
+		 * Force 32k domain status reload to ensure all state is
+		 * correctly reflected after wakeup.
+		 */
+		rtc_regs->SYNCPEND = RTC_RELOAD_FROM_BBD;
+
+		ret = k3_rtc_fence(dev);
+		if (ret != 0) {
+			LOG_ERR("Failed to fence reload from BBD: %d", ret);
+			return ret;
+		}
+
+		ret = k3_rtc_lock(dev);
+		if (ret != 0) {
+			return ret;
+		}
+
+		return 0;
+
+	default:
+		return -ENOTSUP;
+	}
+}
+#endif /* CONFIG_PM_DEVICE */
+
 static int k3_counter_init(const struct device *dev)
 {
 	DEVICE_MMIO_NAMED_MAP(dev, reg_base, K_MEM_CACHE_NONE);
@@ -451,10 +635,10 @@ static int k3_counter_init(const struct device *dev)
 	data->sync_timeout_us = (USEC_PER_SEC / config->osc_freq) * 4;
 
 	/* Enable 32k oscillator dependency */
-	rtc_regs->GENRAL_CTL |= RTC_O32K_OSC_MASK;
+	rtc_regs->GENERAL_CTL |= RTC_O32K_OSC_MASK;
 
 	/* Enable freeze mode for atomic 48-bit reads */
-	rtc_regs->GENRAL_CTL |= RTC_CNT_FMODE_MASK;
+	rtc_regs->GENERAL_CTL |= RTC_CNT_FMODE_MASK;
 
 	/* Clear and disable all interrupts */
 	rtc_regs->IRQSTATUS_SYS = RTC_IRQ_STATUS_MASK;
@@ -525,3 +709,10 @@ static DEVICE_API(counter, k3_counter_api) = {
 	);
 
 DT_INST_FOREACH_STATUS_OKAY(TI_K3_COUNTER_INIT)
+
+#ifdef CONFIG_PM_DEVICE
+#define TI_K3_COUNTER_PM_INIT(i)							\
+	PM_DEVICE_DT_INST_DEFINE(i, k3_rtc_pm_action);
+
+DT_INST_FOREACH_STATUS_OKAY(TI_K3_COUNTER_PM_INIT)
+#endif /* CONFIG_PM_DEVICE */
