@@ -209,9 +209,9 @@ controllers, MMU, linker scripts, context switching).
 - **Device driver model**: `DEVICE_DEFINE` / `DEVICE_DT_DEFINE` + API structs.
 - **Ztest**: `ZTEST_SUITE` + `ZTEST(suite, test_name)` macros.
 
-## TI AM62L Platform (branch: am62l_lpm)
+## TI AM62L Platform (branch: pr-114)
 
-The `am62l_lpm` branch implements S2RAM (suspend-to-RAM / deep-sleep LPM)
+This branch (`pr-114`) implements S2RAM (suspend-to-RAM / deep-sleep LPM)
 for the TI AM62L EVM (Cortex-A53, arm64). This is the first S2RAM implementation
 for any arm64 board in upstream Zephyr.
 
@@ -226,7 +226,18 @@ west build -p always -b am62l_evm/am62l3/a53 samples/hello_world
 
 # Run compliance on the LPM feature commits
 ./scripts/ci/check_compliance.py -c cde0a961d82..HEAD
+
+# Flash / debug via OpenOCD + XDS110 JTAG
+west flash --runner openocd
+west debug --runner openocd
+# Or directly (board.cmake wires --target-handle am62l.cpu.a53.0):
+openocd -f boards/ti/am62l_evm/support/openocd.cfg
 ```
+
+Note: `boards/ti/am62l_evm/support/openocd.cfg` is a standalone config that does NOT
+source `ti_k3.cfg` because the AM62L TAP ID (`0x0bba702f`) differs from AM625
+(`0x0bb7e02f`) in PARTNO (not just version nibble), and the AM625 power-AP unlock
+offsets cause bus errors on the external XDS110 when used against AM62L.
 
 ### Full firmware stack build (TF-A → U-Boot → Zephyr)
 
@@ -301,18 +312,23 @@ The feature is spread across several layers that must all be consistent:
 
 | File | Role |
 |------|------|
-| `arch/arm64/core/pm_s2ram.S` | Save/restore callee-saved GPRs + SP/VBAR_EL1; `arch_pm_s2ram_resume` is the EL1 re-entry point passed to TF-A |
-| `arch/arm64/core/pm_s2ram.c` | `_cpu_context` struct (`_cpu_context_t`), suspend marker (magic 0xDABBAD00 in `__noinit` DDR) |
-| `include/zephyr/arch/arm64/cpu.h` | `_cpu_context_t` struct (sp + vbar_el1); `arch_pm_s2ram_resume` extern declaration |
-| `soc/ti/k3/am62lx/power.c` | `pm_state_set()` / `pm_state_exit_post_ops()`; SMP CPU1 OFF handshake; `am62l_system_off()` calls `psci_system_suspend()` |
-| `drivers/pm_cpu_ops/pm_cpu_ops_psci.c` | `psci_system_suspend(entry_point)` — PSCI 1.0 SYSTEM_SUSPEND SMC; also `psci_affinity_info()` for SMP polling |
-| `drivers/counter/counter_k3_rtc.c` | K3 RTC counter driver — wakeup alarm, `GENERAL_CTL` unlock sequence, PM suspend/resume hooks |
-| `drivers/i2c/i2c_omap.c` | OMAP I2C PM hooks — re-programs all hardware registers on `TURN_ON` (registers lost when MAIN domain is cut) |
-| `drivers/serial/uart_ns16550.c` | NS16550 UART PM hooks — saves/restores UART registers across S2RAM |
-| `drivers/power_domain/power_domain_arm_scmi.c` | `CONFIG_POWER_DOMAIN_ARM_SCMI_LPM_MANAGED` bypass — skips Zephyr SCMI power-off/on since TF-A/TIFS manages domains during LPM |
-| `dts/arm64/ti/am62l3_a53.dtsi` | `idle-states` + `cpu-idle-states` that wire `suspend-to-ram` into the PM policy |
+| `arch/Kconfig` | `select ARCH_HAS_SUSPEND_TO_RAM` added to ARM64 — enables `CONFIG_PM_S2RAM` auto-selection |
+| `arch/arm64/core/pm_s2ram.S` | Save/restore callee-saved GPRs (x19–x30) + SP/VBAR_EL1 to `_cpu_context`; `arch_pm_s2ram_resume` is the EL1 re-entry point passed to TF-A via PSCI |
+| `arch/arm64/core/pm_s2ram.c` | `_cpu_context_t` in `__noinit` DDR (sp + vbar_el1); suspend marker (magic `0xDABBAD00`); `pm_s2ram_mark_set` / `pm_s2ram_mark_check_and_clear` |
+| `arch/arm64/core/smp.c` | Resume path fix: when `cpu_map[cpu_num] != INV_MPID` (DDR retained), skip the `cpu_node_list` scan and call `pm_cpu_on` directly — avoids a `k_panic()` on the exhausted iterator |
+| `include/zephyr/arch/arm64/cpu.h` | `_cpu_context_t` struct (sp + vbar_el1); `arch_pm_s2ram_resume` extern (under `CONFIG_PM_S2RAM`) |
+| `soc/ti/k3/am62lx/power.c` | `pm_state_set()` / `pm_state_exit_post_ops()`; SMP CPU1 OFF handshake via SGI3 + `psci_affinity_info()` polling; `am62l_system_off()` calls `psci_system_suspend()` |
+| `soc/ti/k3/common/CMakeLists.txt` | Compiles `power.c` when `CONFIG_SOC_SERIES_AM62LX_A53 && CONFIG_PM_S2RAM` |
+| `drivers/pm_cpu_ops/pm_cpu_ops_psci.c` | New `psci_system_suspend(entry_point)` (PSCI 1.0 SYSTEM_SUSPEND SMC) and `psci_affinity_info()` for SMP polling |
+| `drivers/counter/counter_k3_rtc.c` | K3 RTC counter driver — wakeup alarm, `GENERAL_CTL` unlock sequence (typo `GENRAL_CTL` fixed here), `k3_rtc_lock()`, PM `SUSPEND`/`RESUME` hooks that arm/clear the PMIC power-off bits |
+| `drivers/i2c/i2c_omap.c` | OMAP I2C `PM_DEVICE_ACTION_TURN_ON` hook — re-programs all hardware registers lost when MAIN power domain is cut (calls `i2c_omap_set_speed` + `i2c_omap_init_ll`) |
+| `drivers/serial/uart_ns16550.c` | NS16550 UART PM hooks — on `TURN_ON`, calls `clock_control_on` before `uart_ns16550_configure()` because on TI K3 the configure function accesses MDR1 before its internal clock-enable, racing against a gated clock |
+| `drivers/power_domain/power_domain_arm_scmi.c` | `CONFIG_POWER_DOMAIN_ARM_SCMI_LPM_MANAGED` compile guard — skips Zephyr SCMI power-off/on calls since TF-A/TIFS manages domains during LPM; children still get `TURN_OFF`/`TURN_ON` |
+| `dts/arm64/ti/am62l3_a53.dtsi` | `power-states { rtc_ddr }` node + `cpu-power-states` on both CPUs to wire `suspend-to-ram` into PM policy; RTC interrupt (GIC SPI 28) |
 | `dts/vendor/ti/am62l-wakeup.dtsi` | `wkup_rtc0` node (address `0x2b1f0000`, compat `ti,am62l-rtc`) |
-| `samples/boards/ti/am62l_lpm/` | End-to-end demo: arm RTC alarm → force S2RAM → verify I2C EEPROM after resume |
+| `boards/ti/am62l_evm/board.cmake` | `openocd` runner wired to `support/openocd.cfg`, target-handle `am62l.cpu.a53.0` |
+| `boards/ti/am62l_evm/support/openocd.cfg` | Standalone AM62L OpenOCD config (TAP ID `0x0bba702f`); two A53 cores only |
+| `samples/boards/ti/am62l_lpm/` | End-to-end demo: read AT24 EEPROM pre-suspend → arm RTC alarm → force S2RAM → verify EEPROM matches post-resume (proves I2C TURN_ON worked) |
 
 ### Suspend call chain (CPU0)
 
@@ -347,6 +363,13 @@ handler):
 - CPU0 polls `psci_affinity_info()` until AFF_STATE_OFF
 - On resume `k_smp_cpu_resume()` cold-boots CPU1 via PSCI CPU_ON
 
+**`arch/arm64/core/smp.c` resume path fix:** `arch_cpu_start()` (called by
+`k_smp_cpu_resume`) was written for cold-boot only: it scanned
+`cpu_node_list[]` using a static iterator `i`, which is exhausted after first
+boot, causing a `k_panic()` on the second call. The fix checks
+`cpu_map[cpu_num] != INV_MPID` first — if the MPID is already known (DDR
+retained it across self-refresh), skip the scan and call `pm_cpu_on` directly.
+
 ### PM-relevant Kconfig symbols
 
 | Symbol | Where set | Meaning |
@@ -368,20 +391,10 @@ powered off, DDR retained in self-refresh, all standard wakeup sources active.
 | `0x7` | `RTC_ONLY` | Most aggressive — DDR not retained |
 | `0xFF` | `INVALID` | Sentinel — never passed to TIFS |
 
-**TF-A bug 1 — missing `am62l_lpm_state` assignment:** `am62l_get_sys_suspend_power_state` in
-`plat/ti/k3low/common/am62l_psci.c` must set
-`am62l_lpm_state = TI_K3_SLEEP_MODE_DEEP_SLEEP`. Without this assignment,
-the `k3_gic_its_save()` call in `am62l_pwr_domain_suspend` is skipped
-(it is gated on `am62l_lpm_state != INVALID`), leaving GIC ITS context
-lost on resume and causing a corrupted PC on re-entry to Zephyr.
-
-**TF-A bug 2 — bakery lock deadlock on warmboot:** The PSCI framework holds
-power-domain bakery locks throughout `pwr_domain_suspend()` and releases
-them at `psci_cpu_suspend_start:214` only if that callback returns. The
-original AM62L code called `k3low_suspend_to_ram()` (the final WFI) at
-the end of `pwr_domain_suspend()`, which never returned, so the lock was
-still held in DDR-retained memory on warm-boot. `psci_warmboot_entrypoint`
-then hit `assert(!is_lock_acquired(...))` in `bakery_get_ticket()`. Fix:
-remove `k3low_suspend_to_ram()` from `pwr_domain_suspend()` (let it return
-normally) and call it from `pwr_domain_pwr_down()` instead, which runs
-after the PSCI lock release.
+**GIC ITS context on resume:** Zephyr calls `psci_system_suspend()` directly
+without modifying TF-A's `am62l_lpm_state` — that variable is used by the
+S2Idle path in Linux, which is not exercised here. TF-A selects the LPM mode
+via its own internal `mode` variable. However, TF-A gates `k3_gic_its_save()`
+on `am62l_lpm_state != INVALID`, which means GIC ITS context is not saved by
+TF-A on the Zephyr path. Zephyr must therefore save and restore GIC ITS
+context itself around `psci_system_suspend()`.

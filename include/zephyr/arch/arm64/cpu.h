@@ -267,15 +267,25 @@
 
 /*
  * CPU context for S2RAM on arm64.
- * TF-A restores all EL1 system registers (SCTLR_EL1, TCR_EL1, CPACR_EL1,
- * MAIR_EL1, page-table regs) via cm_el1_sysregs_context_restore() before
- * branching to EL1.  Zephyr only needs to save what TF-A does not: the stack
- * pointer (TF-A has no knowledge of the Zephyr stack) and VBAR_EL1
- * (defensive, in case of older TF-A).  GPRs are saved on the stack.
+ *
+ * TF-A's PSCI_SYSTEM_SUSPEND path does not call
+ * cm_el1_sysregs_context_restore() on resume when am62l_lpm_state is
+ * INVALID (which is always the case when Zephyr calls PSCI_SYSTEM_SUSPEND
+ * directly without going through the Linux S2Idle path).  Zephyr must
+ * therefore save and restore the full MMU configuration itself.
+ *
+ * sctlr_el1 is saved last on suspend and restored last on resume so that
+ * the MMU is re-enabled only after MAIR/TCR/TTBR0 are all in place.
+ * GPRs are saved on the DDR-retained stack.
  */
 struct __cpu_context {
-	uint64_t sp;
-	uint64_t vbar_el1;
+	uint64_t sp;          /* offset  0 */
+	uint64_t vbar_el1;    /* offset  8 */
+	uint64_t mair_el1;    /* offset 16 */
+	uint64_t tcr_el1;     /* offset 24 */
+	uint64_t ttbr0_el1;   /* offset 32 */
+	uint64_t sctlr_el1;   /* offset 40 — restore last to re-enable MMU */
+	uint64_t cpacr_el1;   /* offset 48 — FP/SIMD access; TF-A resets to 0 */
 };
 
 typedef struct __cpu_context _cpu_context_t;
