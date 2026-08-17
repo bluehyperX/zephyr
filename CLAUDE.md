@@ -79,15 +79,25 @@ Follow [Linux kernel coding style](https://kernel.org/doc/html/latest/process/co
 
 - **Tabs** are 8 characters; **line length** ≤ 100 columns.
 - Always add braces to `if`, `else`, `do`, `while`, `for`, and `switch` bodies — even single-line blocks.
-- Use `/* */` for comments; `//` is **not** allowed.
+- Use `/* */` for comments; `//` is **not** allowed (SPDX headers are the only exception).
 - Use `/** */` for Doxygen API documentation.
-- No binary literals (`0b...`), no non-ASCII symbols.
+- No binary literals (`0b...`), no non-ASCII symbols, no ASCII decoration in comments.
 - Use fixed-width types (`uint8_t`, `int32_t`) instead of bare `int`/`char`.
 - Capitalize correctly in comments: `UART` not `uart`, `CMake` not `cmake`.
-- No dynamic memory allocation (`malloc`, `calloc`) — MISRA-C requirement.
 - All public APIs must be prefixed by subsystem: `k_` (kernel), `sys_`, `net_`,
   `bt_`, `i2c_`, etc.
 - Style is enforced on **new or modified code only** — do not reformat unrelated code.
+
+### MISRA-C Rules (non-obvious subset)
+
+- No dynamic memory allocation (`malloc`, `calloc`).
+- No commented-out code sections.
+- All header files must have include guards.
+- No octal constants (`0755` is forbidden; use hex or decimal).
+- Apply a `u` or `U` suffix to all unsigned integer constants; never use lowercase `l`.
+- Check the return value of every function that returns error information.
+- Prefer `static inline` functions over function-like macros.
+- Identifiers must be unique across scopes; no shadowing of outer-scope identifiers.
 
 ### CMake Style
 
@@ -95,12 +105,26 @@ Follow [Linux kernel coding style](https://kernel.org/doc/html/latest/process/co
 - Lowercase commands: `add_library`, not `ADD_LIBRARY`.
 - No space between command and parenthesis: `if(...)` not `if (...)`.
 - UPPERCASE for cache/shared variables; lowercase/snake_case for locals.
+- Quote strings and path variables; do not quote boolean values (`ON`, `OFF`).
+- One source file argument per line in `target_sources()` and similar calls.
 
 ### Kconfig Style
 
 - Tab indentation; `help` text: one tab + two extra spaces.
-- One blank line between symbol declarations.
+- One blank line between symbol declarations; one blank line before/after top-level `if`/`endif`.
 - Comments: `# Comment` (space after `#`).
+- Use `menuconfig` (not `config`) for symbols that have sub-options; encapsulate sub-symbols in an `if` block keyed to the enabling symbol and prefix them with the enabling symbol's name.
+
+Symbol naming conventions:
+
+| Subtree | Symbol format |
+|---|---|
+| Drivers | `{DRIVER_TYPE}_{DRIVER_NAME}` |
+| Sensors | `SENSOR_{SENSOR_NAME}` |
+| Samples | `SAMPLE_...` |
+| Tests | `TEST_...` |
+| Boards | `BOARD_...` |
+| SoCs | `SOC_FAMILY_...`, `SOC_SERIES_...`, or `SOC_...` |
 
 ### Devicetree Style
 
@@ -121,11 +145,12 @@ Signed-off-by: Your Full Name <your.email@example.com>
 ```
 
 Rules:
-- Title: one line, ≤ 72 characters, followed by a blank line.
-- Body **must not be empty** (CI will fail).
+- Title: one line, ≤ 75 characters, followed by a blank line.
+- Body **must not be empty** (CI will fail). Lines ≤ 75 characters.
 - `Signed-off-by` is required for DCO compliance (`git commit -s`). **AI agents must not add `Signed-off-by`** — only the human submitter may sign.
 - Do **not** add `Co-authored-by`.
-- When AI tools are used, add `Assisted-by: Claude:<model-version>`.
+- When AI tools are used, add `Assisted-by: Claude:<model-version>` (add tool names if advanced tools like coccinelle were used).
+- To auto-close a GitHub issue on merge, add `Fixes #[issue number]` to the commit message body or PR description.
 
 Common `[area]` prefixes (run `git log <file>` to follow existing conventions):
 - `doc:` — documentation changes
@@ -186,7 +211,7 @@ controllers, MMU, linker scripts, context switching).
 
 ## TI AM62L Platform (branch: am62l_lpm)
 
-The `am62l_lpm` branch implements S2RAM (suspend-to-RAM / RTC+DDR low power mode)
+The `am62l_lpm` branch implements S2RAM (suspend-to-RAM / deep-sleep LPM)
 for the TI AM62L EVM (Cortex-A53, arm64). This is the first S2RAM implementation
 for any arm64 board in upstream Zephyr.
 
@@ -272,14 +297,19 @@ sudo cp /home/a0510137local/ti/zephyrproject/zephyr/build/zephyr/zephyr.bin /srv
 
 ### S2RAM architecture — key files and their roles
 
-The feature is spread across six layers that must all be consistent:
+The feature is spread across several layers that must all be consistent:
 
 | File | Role |
 |------|------|
 | `arch/arm64/core/pm_s2ram.S` | Save/restore callee-saved GPRs + SP/VBAR_EL1; `arch_pm_s2ram_resume` is the EL1 re-entry point passed to TF-A |
-| `arch/arm64/core/pm_s2ram.c` | `_cpu_context` struct, suspend marker (magic 0xDABBAD00 in `__noinit` DDR) |
-| `soc/ti/k3/am62lx/power.c` | `pm_state_set()` / `pm_state_exit_post_ops()`; SMP CPU1 OFF handshake before suspend |
-| `drivers/pm_cpu_ops/pm_cpu_ops_psci.c` | `psci_cpu_suspend()` — the SMC that drops into TF-A |
+| `arch/arm64/core/pm_s2ram.c` | `_cpu_context` struct (`_cpu_context_t`), suspend marker (magic 0xDABBAD00 in `__noinit` DDR) |
+| `include/zephyr/arch/arm64/cpu.h` | `_cpu_context_t` struct (sp + vbar_el1); `arch_pm_s2ram_resume` extern declaration |
+| `soc/ti/k3/am62lx/power.c` | `pm_state_set()` / `pm_state_exit_post_ops()`; SMP CPU1 OFF handshake; `am62l_system_off()` calls `psci_system_suspend()` |
+| `drivers/pm_cpu_ops/pm_cpu_ops_psci.c` | `psci_system_suspend(entry_point)` — PSCI 1.0 SYSTEM_SUSPEND SMC; also `psci_affinity_info()` for SMP polling |
+| `drivers/counter/counter_k3_rtc.c` | K3 RTC counter driver — wakeup alarm, `GENERAL_CTL` unlock sequence, PM suspend/resume hooks |
+| `drivers/i2c/i2c_omap.c` | OMAP I2C PM hooks — re-programs all hardware registers on `TURN_ON` (registers lost when MAIN domain is cut) |
+| `drivers/serial/uart_ns16550.c` | NS16550 UART PM hooks — saves/restores UART registers across S2RAM |
+| `drivers/power_domain/power_domain_arm_scmi.c` | `CONFIG_POWER_DOMAIN_ARM_SCMI_LPM_MANAGED` bypass — skips Zephyr SCMI power-off/on since TF-A/TIFS manages domains during LPM |
 | `dts/arm64/ti/am62l3_a53.dtsi` | `idle-states` + `cpu-idle-states` that wire `suspend-to-ram` into the PM policy |
 | `dts/vendor/ti/am62l-wakeup.dtsi` | `wkup_rtc0` node (address `0x2b1f0000`, compat `ti,am62l-rtc`) |
 | `samples/boards/ti/am62l_lpm/` | End-to-end demo: arm RTC alarm → force S2RAM → verify I2C EEPROM after resume |
@@ -288,12 +318,13 @@ The feature is spread across six layers that must all be consistent:
 
 ```
 pm_state_set(S2RAM)
-  → [SMP] signal CPU1 via SGI3 → CPU1 calls psci_cpu_suspend or pm_cpu_off
+  → [SMP] signal CPU1 via SGI3 → CPU1 calls pm_cpu_off() (PSCI CPU_OFF)
+  → [SMP] CPU0 polls psci_affinity_info(CPU1_MPIDR) until AFF_STATE_OFF
   → arch_pm_s2ram_suspend(am62l_system_off)   [pm_s2ram.S]
     → save x19–x30 on stack, SP + VBAR_EL1 to _cpu_context
     → pm_s2ram_mark_set()  (write 0xDABBAD00 to __noinit DDR)
     → am62l_system_off()
-      → psci_cpu_suspend(LPM_PSTATE_DEEPSLEEP, arch_pm_s2ram_resume)
+      → psci_system_suspend(arch_pm_s2ram_resume)  ← SYSTEM_SUSPEND not CPU_SUSPEND
         → SMC → TF-A EL3 → TIFS: DDR self-refresh, A53 power-down
 
 [RTC alarm fires]
@@ -303,7 +334,7 @@ TF-A EL3 → restore EL1 sysregs → ERET to arch_pm_s2ram_resume
   → pop x19–x30 from DDR-retained stack
   → return x0=0 to arch_pm_s2ram_suspend call site
 pm_state_exit_post_ops()  → irq_unlock(0)
-  → [SMP] wake CPU1 via SGI3
+  → [SMP] k_smp_cpu_resume(1) → PSCI CPU_ON cold-boots CPU1
 ```
 
 ### SMP behaviour
@@ -324,3 +355,33 @@ handler):
 | `CONFIG_PM_S2RAM` | auto (Kconfig) | Auto-selected when `ARCH_HAS_SUSPEND_TO_RAM` + DT power-state present |
 | `CONFIG_PM_DEVICE_SYSTEM_MANAGED` | defconfig | Kernel calls TURN_OFF/TURN_ON on all devices around suspend |
 | `CONFIG_POWER_DOMAIN_ARM_SCMI_LPM_MANAGED` | defconfig | Skip Zephyr SCMI power-off calls — TF-A/TIFS manages domains during LPM |
+
+### AM62L LPM modes
+
+S2RAM uses **deep sleep** (`TI_K3_SLEEP_MODE_DEEP_SLEEP = 0x0`): A53 cluster
+powered off, DDR retained in self-refresh, all standard wakeup sources active.
+
+| TIFS mode value | Name | Description |
+|---|---|---|
+| `0x0` | `DEEP_SLEEP` | S2RAM — A53 off, DDR retained, all wakeup sources |
+| `0x6` | `RTC_PLUS_DDR` | A53 off, DDR retained, RTC wakeup only |
+| `0x7` | `RTC_ONLY` | Most aggressive — DDR not retained |
+| `0xFF` | `INVALID` | Sentinel — never passed to TIFS |
+
+**TF-A bug 1 — missing `am62l_lpm_state` assignment:** `am62l_get_sys_suspend_power_state` in
+`plat/ti/k3low/common/am62l_psci.c` must set
+`am62l_lpm_state = TI_K3_SLEEP_MODE_DEEP_SLEEP`. Without this assignment,
+the `k3_gic_its_save()` call in `am62l_pwr_domain_suspend` is skipped
+(it is gated on `am62l_lpm_state != INVALID`), leaving GIC ITS context
+lost on resume and causing a corrupted PC on re-entry to Zephyr.
+
+**TF-A bug 2 — bakery lock deadlock on warmboot:** The PSCI framework holds
+power-domain bakery locks throughout `pwr_domain_suspend()` and releases
+them at `psci_cpu_suspend_start:214` only if that callback returns. The
+original AM62L code called `k3low_suspend_to_ram()` (the final WFI) at
+the end of `pwr_domain_suspend()`, which never returned, so the lock was
+still held in DDR-retained memory on warm-boot. `psci_warmboot_entrypoint`
+then hit `assert(!is_lock_acquired(...))` in `bakery_get_ticket()`. Fix:
+remove `k3low_suspend_to_ram()` from `pwr_domain_suspend()` (let it return
+normally) and call it from `pwr_domain_pwr_down()` instead, which runs
+after the PSCI lock release.

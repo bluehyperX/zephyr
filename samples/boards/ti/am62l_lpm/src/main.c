@@ -36,7 +36,7 @@
 
 LOG_MODULE_REGISTER(am62l_lpm, LOG_LEVEL_INF);
 
-#define WAKE_DELAY_S    20U
+#define WAKE_DELAY_S    5U
 #define EEPROM_OFFSET   0U
 #define EEPROM_LEN      3U
 
