@@ -13,9 +13,9 @@
  *      psci_affinity_info() works correctly here.
  *   2. CPU0 polls psci_affinity_info until it returns non-zero (CPU1 off).
  *   3. CPU0 calls arch_pm_s2ram_suspend() -> psci_cpu_suspend(DEEPSLEEP).
- *   4. On resume CPU0 calls k_smp_cpu_resume(1, ...) which restarts CPU1
- *      via pm_cpu_on, runs arch_secondary_cpu_init, reinits GIC and timer,
- *      and rejoins the scheduler.
+ *   4. On resume CPU0 calls k_smp_cpu_start(1, ...) which reinitialises
+ *      the idle thread ESF (z_init_cpu), then starts CPU1 via pm_cpu_on.
+ *      arch_secondary_cpu_init reinits GIC and timer; scheduler follows.
  */
 
 #include <zephyr/kernel.h>
@@ -49,6 +49,16 @@ static void am62l_s2ram_cpu1_ipi(const void *arg)
 {
 	ARG_UNUSED(arg);
 	if (atomic_get(&s2ram_cpu1_req)) {
+		/*
+		 * Park _current so the scheduler can pick it up after resume.
+		 * pm_cpu_off() bypasses z_arm64_context_switch (switch.S:99),
+		 * the only path that sets switch_handle = thread.  Without this,
+		 * _current->switch_handle stays NULL; on the next CPU1 boot,
+		 * next_up() may return this (idle) thread and z_sched_switch_spin
+		 * deadlocks.  callee_saved is valid from the last cooperative
+		 * context switch and will be used to restart the idle loop.
+		 */
+		_current->switch_handle = _current;
 		/*
 		 * Power CPU1 off entirely.  TF-A sets aff_info_state = OFF
 		 * on CPU_OFF, allowing CPU0 to use psci_affinity_info().
@@ -105,14 +115,25 @@ void pm_state_set(enum pm_state state, uint8_t substate_id)
 
 #ifdef CONFIG_SMP
 		/*
-		 * Restart CPU1 via the Zephyr SMP resume API.  CPU1 was
-		 * fully powered off by PSCI CPU_OFF; pm_cpu_on (inside
-		 * k_smp_cpu_resume) starts it fresh at __start.
-		 * arch_secondary_cpu_init() reinits the GIC and arch timer,
-		 * then the scheduler re-acquires CPU1 automatically.
+		 * Restart CPU1 via k_smp_cpu_start.  k_smp_cpu_resume would
+		 * skip z_init_cpu(), leaving z_idle_threads[1].pInitCtx with a
+		 * corrupted SPSR field: z_thread_entry's prologue (stp/str
+		 * x23,[sp,#48]) overwrote it with 0 during the first boot.
+		 * SPSR=0 causes z_arm64_exit_exc to ERET to EL0t, which
+		 * immediately faults because SP_EL0 is 0.
+		 *
+		 * k_smp_cpu_start calls z_init_cpu(1) → init_idle_thread(1)
+		 * → arch_new_thread, which writes a fresh pInitCtx ESF with
+		 * SPSR = EL1h | DAIF before CPU1 is powered on.  It also sets
+		 * reinit_timer=true and invoke_sched=true, matching the old
+		 * k_smp_cpu_resume(1, NULL, NULL, true, true) behaviour.
+		 *
+		 * arch_cpu_start (smp.c resume path) detects cpu_map[1] !=
+		 * INV_MPID and calls pm_cpu_on directly, so the cpu_node_list
+		 * scan (which would k_panic on an exhausted iterator) is skipped.
 		 */
 		atomic_set(&s2ram_cpu1_req, 0);
-		k_smp_cpu_resume(1, NULL, NULL, true, true);
+		k_smp_cpu_start(1, NULL, NULL);
 #endif
 		break;
 
