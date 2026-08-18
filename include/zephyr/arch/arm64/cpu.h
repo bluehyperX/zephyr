@@ -271,21 +271,28 @@
  * TF-A's PSCI_SYSTEM_SUSPEND path does not call
  * cm_el1_sysregs_context_restore() on resume when am62l_lpm_state is
  * INVALID (which is always the case when Zephyr calls PSCI_SYSTEM_SUSPEND
- * directly without going through the Linux S2Idle path).  Zephyr must
- * therefore save and restore the full MMU configuration itself.
+ * directly without going through the Linux S2Idle path).  All EL1/EL0
+ * CPU system registers reset to hardware defaults; Zephyr must restore
+ * the full set here.
  *
  * sctlr_el1 is saved last on suspend and restored last on resume so that
  * the MMU is re-enabled only after MAIR/TCR/TTBR0 are all in place.
- * GPRs are saved on the DDR-retained stack.
+ * GPRs (x19-x30) are saved on the DDR-retained stack.
  */
 struct __cpu_context {
-	uint64_t sp;          /* offset  0 */
-	uint64_t vbar_el1;    /* offset  8 */
-	uint64_t mair_el1;    /* offset 16 */
-	uint64_t tcr_el1;     /* offset 24 */
-	uint64_t ttbr0_el1;   /* offset 32 */
-	uint64_t sctlr_el1;   /* offset 40 — restore last to re-enable MMU */
-	uint64_t cpacr_el1;   /* offset 48 — FP/SIMD access; TF-A resets to 0 */
+	uint64_t sp;             /* offset  0 */
+	uint64_t vbar_el1;       /* offset  8 */
+	uint64_t mair_el1;       /* offset 16 */
+	uint64_t tcr_el1;        /* offset 24 */
+	uint64_t ttbr0_el1;      /* offset 32 */
+	uint64_t sctlr_el1;      /* offset 40 — restore last to re-enable MMU */
+	uint64_t cpacr_el1;      /* offset 48 — FP/SIMD access; TF-A resets to 0 */
+	uint64_t tpidrro_el0;    /* offset 56 — CPU struct pointer; TF-A resets to 0 */
+	uint64_t mdscr_el1;      /* offset 64 — debug state control */
+	uint64_t tpidr_el0;      /* offset 72 — EL0 thread pointer */
+	uint64_t contextidr_el1; /* offset 80 — ASID context */
+	uint64_t sp_el0;         /* offset 88 — EL0 stack pointer */
+	uint64_t osdlr_el1;      /* offset 96 — OS Double Lock */
 };
 
 typedef struct __cpu_context _cpu_context_t;
