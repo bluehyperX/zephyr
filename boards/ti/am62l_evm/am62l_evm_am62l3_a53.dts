@@ -42,7 +42,7 @@
 		};
 
 		cpu@1 {
-			status = "okay";
+			status = "disabled";
 		};
 	};
 

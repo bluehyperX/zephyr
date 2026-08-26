@@ -107,6 +107,12 @@ void arch_cpu_start(int cpu_num, k_thread_stack_t *stack, int sz,
 			       cpu_num, cpu_mpid);
 			k_panic();
 		}
+		/* Wait secondary core up, then announce (mirrors the cold-boot path) */
+		while (arm64_cpu_boot_params.fn) {
+			wfe();
+		}
+		printk("Secondary CPU core %d (MPID:%#llx) is up\n", cpu_num, cpu_mpid);
+		return;
 	} else {
 		for (; i < cpu_count; i++) {
 			if (cpu_node_list[i] == primary_core_mpid) {
@@ -164,6 +170,7 @@ FUNC_NORETURN void arch_secondary_cpu_init(void)
 	write_tpidrro_el0((uintptr_t)&_kernel.cpus[cpu_num]);
 
 	z_arm64_mm_init(false);
+	printk("CPU%d: MMU init done\n", cpu_num);
 
 #ifdef CONFIG_ARM64_SAFE_EXCEPTION_STACK
 	z_arm64_safe_exception_stack_init();
@@ -171,6 +178,7 @@ FUNC_NORETURN void arch_secondary_cpu_init(void)
 
 #ifdef CONFIG_SMP
 	arm_gic_secondary_init();
+	printk("CPU%d: GIC init done\n", cpu_num);
 
 	irq_enable(SGI_SCHED_IPI);
 #ifdef CONFIG_USERSPACE
@@ -186,6 +194,8 @@ FUNC_NORETURN void arch_secondary_cpu_init(void)
 	fn = arm64_cpu_boot_params.fn;
 	arg = arm64_cpu_boot_params.arg;
 	barrier_dsync_fence_full();
+
+	printk("CPU%d: signalling ready, entering scheduler\n", cpu_num);
 
 	/*
 	 * Secondary core clears .fn to announce its presence.
