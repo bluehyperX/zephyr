@@ -89,6 +89,20 @@ static int am62l_system_off(void)
 	return psci_system_suspend(resume_pa);
 }
 
+/*
+ * ARM arch timer save/restore across S2RAM.
+ *
+ * arch_pm_s2ram_suspend/resume saves MMU, VBAR, and callee-saved GPRs but
+ * not the ARM arch timer registers.  The MAIN power domain cut resets
+ * CNTV_CTL_EL0 to 0x2 (ENABLE=0, IMASK=1) and CNTV_CVAL_EL0 to an
+ * unknown value, preventing tick interrupts after resume.
+ *
+ * Zephyr's arm64 timer driver uses the virtual timer (CNTV), not the
+ * physical timer (CNTP).
+ */
+static uint64_t s2ram_cntv_cval;
+static uint64_t s2ram_cntv_ctl;
+
 void pm_state_set(enum pm_state state, uint8_t substate_id)
 {
 	ARG_UNUSED(substate_id);
@@ -111,30 +125,11 @@ void pm_state_set(enum pm_state state, uint8_t substate_id)
 		 * Save CPU0 context and call PSCI_SYSTEM_SUSPEND.
 		 * Returns here after full resume and TURN_ON for all devices.
 		 */
+		s2ram_cntv_cval = read_sysreg(cntv_cval_el0);
+		s2ram_cntv_ctl  = read_sysreg(cntv_ctl_el0);
 		arch_pm_s2ram_suspend(am62l_system_off);
-
-#ifdef CONFIG_SMP
-		/*
-		 * Restart CPU1 via k_smp_cpu_start.  k_smp_cpu_resume would
-		 * skip z_init_cpu(), leaving z_idle_threads[1].pInitCtx with a
-		 * corrupted SPSR field: z_thread_entry's prologue (stp/str
-		 * x23,[sp,#48]) overwrote it with 0 during the first boot.
-		 * SPSR=0 causes z_arm64_exit_exc to ERET to EL0t, which
-		 * immediately faults because SP_EL0 is 0.
-		 *
-		 * k_smp_cpu_start calls z_init_cpu(1) → init_idle_thread(1)
-		 * → arch_new_thread, which writes a fresh pInitCtx ESF with
-		 * SPSR = EL1h | DAIF before CPU1 is powered on.  It also sets
-		 * reinit_timer=true and invoke_sched=true, matching the old
-		 * k_smp_cpu_resume(1, NULL, NULL, true, true) behaviour.
-		 *
-		 * arch_cpu_start (smp.c resume path) detects cpu_map[1] !=
-		 * INV_MPID and calls pm_cpu_on directly, so the cpu_node_list
-		 * scan (which would k_panic on an exhausted iterator) is skipped.
-		 */
-		atomic_set(&s2ram_cpu1_req, 0);
-		k_smp_cpu_start(1, NULL, NULL);
-#endif
+		/* Confirm Zephyr-side resume path executed (timer-independent). */
+		printk("pm_state_set: resumed from S2RAM\n");
 		break;
 
 	case PM_STATE_SUSPEND_TO_IDLE:
@@ -149,8 +144,29 @@ void pm_state_set(enum pm_state state, uint8_t substate_id)
 
 void pm_state_exit_post_ops(enum pm_state state, uint8_t substate_id)
 {
-	ARG_UNUSED(state);
 	ARG_UNUSED(substate_id);
+
+	if (state == PM_STATE_SUSPEND_TO_RAM) {
+		/*
+		 * Restore the ARM arch timer registers saved before suspend.
+		 * CVAL is written before CTL so the compare value is in place
+		 * before the timer is re-enabled.
+		 *
+		 * The restore must be a direct write, not read-modify-write:
+		 * the power-domain reset left CNTV_CTL_EL0 = 0x2 (IMASK=1).
+		 * Restoring the saved value (0x1: ENABLE=1, IMASK=0) clears
+		 * IMASK.  An OR-based enable would keep IMASK=1 and suppress
+		 * the interrupt even with ENABLE=1.
+		 *
+		 * The saved CVAL is always in the past after a multi-second
+		 * suspend, so the interrupt fires immediately once IRQs are
+		 * unmasked by irq_unlock() below.  The timer ISR announces all
+		 * elapsed ticks via sys_clock_announce(), unblocking k_msleep.
+		 */
+		write_sysreg(s2ram_cntv_cval, cntv_cval_el0);
+		write_sysreg(s2ram_cntv_ctl,  cntv_ctl_el0);
+	}
+
 	irq_unlock(0);
 }
 

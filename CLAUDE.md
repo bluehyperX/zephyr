@@ -2,399 +2,118 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Build System
+## Repository Overview
 
-Zephyr uses `west` (a meta-tool) as its primary build frontend. All builds are
-out-of-tree — `zephyr/` is **not** the application root; applications live
-alongside it in the workspace.
+This is the Zephyr RTOS repository, used here primarily for TI AM62L SoC low-power mode (LPM / S2RAM) development. The active branch (`am62l_lpm`) adds Suspend-to-RAM support for the AM62L EVM board, exercising the PSCI CPU_SUSPEND path via TF-A.
 
-```bash
-# Build a sample for a specific board (pristine build)
-west build -p always -b <BOARD> samples/hello_world
+Key files under active development:
+- `samples/boards/ti/am62l_lpm/src/main.c` — S2RAM demo: RTC-woken suspend/resume with I2C EEPROM verification
+- `soc/ti/k3/am62lx/power.c` — AM62L PM backend: CPU1 off via SGI IPI, CPU0 PSCI CPU_SUSPEND, SMP resume via `k_smp_cpu_start`
 
-# Incremental rebuild (reuses existing build directory)
-west build
+## Build Commands
 
-# Build in an explicit directory
-west build -b <BOARD> -d build/my_build samples/hello_world
-
-# Flash to hardware
-west flash
-
-# Open an interactive debugger
-west debug
-```
-
-CMake can be used directly, but `west build` is preferred. `ZEPHYR_BASE` must
-point to this repository when using CMake directly.
-
-## Testing
-
-Zephyr uses **Twister** as its test runner and **Ztest** as its test framework.
+The workspace root is `~/ti/zephyrproject/` (west workspace). All `west` commands must be run from the zephyr repo root or workspace root.
 
 ```bash
-# Run all tests under a directory on native_sim (host)
-./scripts/twister -b -p native_sim -T tests/kernel/
+# Build the LPM sample (matches build_lpm/ directory)
+west build -b am62l_evm/am62l3/a53 -d build_lpm samples/boards/ti/am62l_lpm
 
-# Run a single test scenario by name
-./scripts/twister --scenario tests/foo/bar/your.test.scenario.name
+# Rebuild without re-running CMake
+west build -d build_lpm
 
-# List all tests in a directory
-./scripts/twister --list-tests -T tests/kernel
+# Force CMake re-run
+west build -d build_lpm -c
 
-# Run tests via west wrapper
-west twister -T tests/ztest/base
+# Build with extra Kconfig options
+west build -b am62l_evm/am62l3/a53 -d build_lpm samples/boards/ti/am62l_lpm -- -DCONFIG_FOO=y
 ```
 
-Two host-based test targets exist:
-- **`native_sim`**: builds the full Zephyr OS for the host; use for integration
-  tests. Tests do **not** set `type: unit`.
-- **`unit_testing`**: links only the module under test + Ztest stubs; set
-  `type: unit` in `tests.yaml`. Faster but no kernel context.
+The binary to flash is `build_lpm/zephyr/zephyr.bin`.
 
-## Style and Compliance
+## Running Tests
 
-Run the compliance script on your commit range before opening a PR:
+Zephyr uses Twister for its test suite:
 
 ```bash
-./scripts/ci/check_compliance.py -c <commit-range>
+# Run tests for a specific test directory
+./scripts/twister -T tests/kernel/pm/ -p native_sim
+
+# Run a single test case
+./scripts/twister -T tests/kernel/pm/ -p native_sim -k <test_name>
+
+# Run tests relevant to the AM62L board
+./scripts/twister -b am62l_evm/am62l3/a53 -T tests/
 ```
 
-For style-only checks on individual files:
+## Linting and Compliance
 
 ```bash
-# C style
-git diff --cached | ./scripts/checkpatch.pl -
+# Checkpatch on modified files (Linux kernel style)
+./scripts/checkpatch.pl --no-tree -f <file>
 
-# Quick reformat of new C files (then verify against guidelines manually)
-clang-format -i my_source_file.c
+# Run on a git range
+./scripts/checkpatch.pl --no-tree --git HEAD~1..HEAD
 
-# Kconfig style (recursive)
-./scripts/kconfig/kconfig_style.py drivers/sensor/
+# Compliance check (used by CI)
+./scripts/ci/check_compliance.py -m Checkpatch -c HEAD~1..
 ```
 
-## Code Style Rules
+## Code Style Rules (from `.github/copilot-instructions.md`)
 
-Follow [Linux kernel coding style](https://kernel.org/doc/html/latest/process/coding-style.html) with these Zephyr-specific overrides:
-
-- **Tabs** are 8 characters; **line length** ≤ 100 columns.
-- Always add braces to `if`, `else`, `do`, `while`, `for`, and `switch` bodies — even single-line blocks.
-- Use `/* */` for comments; `//` is **not** allowed (SPDX headers are the only exception).
-- Use `/** */` for Doxygen API documentation.
-- No binary literals (`0b...`), no non-ASCII symbols, no ASCII decoration in comments.
-- Use fixed-width types (`uint8_t`, `int32_t`) instead of bare `int`/`char`.
-- Capitalize correctly in comments: `UART` not `uart`, `CMake` not `cmake`.
-- All public APIs must be prefixed by subsystem: `k_` (kernel), `sys_`, `net_`,
-  `bt_`, `i2c_`, etc.
-- Style is enforced on **new or modified code only** — do not reformat unrelated code.
-
-### MISRA-C Rules (non-obvious subset)
-
-- No dynamic memory allocation (`malloc`, `calloc`).
-- No commented-out code sections.
-- All header files must have include guards.
-- No octal constants (`0755` is forbidden; use hex or decimal).
-- Apply a `u` or `U` suffix to all unsigned integer constants; never use lowercase `l`.
-- Check the return value of every function that returns error information.
-- Prefer `static inline` functions over function-like macros.
-- Identifiers must be unique across scopes; no shadowing of outer-scope identifiers.
-
-### CMake Style
-
-- 2-space indentation (no tabs); ≤ 100 columns.
-- Lowercase commands: `add_library`, not `ADD_LIBRARY`.
-- No space between command and parenthesis: `if(...)` not `if (...)`.
-- UPPERCASE for cache/shared variables; lowercase/snake_case for locals.
-- Quote strings and path variables; do not quote boolean values (`ON`, `OFF`).
-- One source file argument per line in `target_sources()` and similar calls.
-
-### Kconfig Style
-
-- Tab indentation; `help` text: one tab + two extra spaces.
-- One blank line between symbol declarations; one blank line before/after top-level `if`/`endif`.
-- Comments: `# Comment` (space after `#`).
-- Use `menuconfig` (not `config`) for symbols that have sub-options; encapsulate sub-symbols in an `if` block keyed to the enabling symbol and prefix them with the enabling symbol's name.
-
-Symbol naming conventions:
-
-| Subtree | Symbol format |
-|---|---|
-| Drivers | `{DRIVER_TYPE}_{DRIVER_NAME}` |
-| Sensors | `SENSOR_{SENSOR_NAME}` |
-| Samples | `SAMPLE_...` |
-| Tests | `TEST_...` |
-| Boards | `BOARD_...` |
-| SoCs | `SOC_FAMILY_...`, `SOC_SERIES_...`, or `SOC_...` |
-
-### Devicetree Style
-
-- Tab indentation; tab = 8 characters.
-- Dashes for node/property names; underscores for node labels.
-- Single space on each side of `=` in property definitions.
+- Tabs (8-char) for C; 2-space indent for CMake.
+- Line length ≤ 100 columns.
+- Always brace all control structures, even single-line.
+- `/* */` comments only — `//` is not allowed in C.
+- Fixed-width types (`uint32_t`, `int32_t`) instead of bare `int`/`char`.
+- No `malloc`/`calloc` — static allocation only.
+- SPDX header required on every new file:
+  ```c
+  // SPDX-FileCopyrightText: Copyright The Zephyr Project Contributors
+  // SPDX-License-Identifier: Apache-2.0
+  ```
 
 ## Commit Message Format
 
 ```
-[area]: [summary of change]
+area: summary of change (≤75 chars total including area)
 
-[Commit message body — must be non-empty. Explain what, why, assumptions, and
-how you know it works. Lines ≤ 75 chars.]
+Body explaining what, why, assumptions, and how tested.
+Lines ≤ 75 chars.
 
 Assisted-by: Claude:claude-sonnet-4-6
-Signed-off-by: Your Full Name <your.email@example.com>
+Signed-off-by: Your Name <email>
 ```
 
-Rules:
-- Title: one line, ≤ 75 characters, followed by a blank line.
-- Body **must not be empty** (CI will fail). Lines ≤ 75 characters.
-- `Signed-off-by` is required for DCO compliance (`git commit -s`). **AI agents must not add `Signed-off-by`** — only the human submitter may sign.
+- `AI agents must not add Signed-off-by` — only the human submitter signs off.
 - Do **not** add `Co-authored-by`.
-- When AI tools are used, add `Assisted-by: Claude:<model-version>` (add tool names if advanced tools like coccinelle were used).
-- To auto-close a GitHub issue on merge, add `Fixes #[issue number]` to the commit message body or PR description.
+- Body must not be empty (CI enforces this).
+- Use `git log <file>` to find the correct `area:` prefix for a file.
 
-Common `[area]` prefixes (run `git log <file>` to follow existing conventions):
-- `doc:` — documentation changes
-- `drivers: <type>: <name>:` — driver changes
-- `Bluetooth: <component>:` — Bluetooth changes
-- `net: <component>:` — networking changes
-- `kernel:` — kernel changes
-- `dts:` — treewide devicetree changes
-- `boards: <vendor>:` — board configuration changes
+## Architecture: AM62L LPM / S2RAM Flow
 
-## Licensing
+The S2RAM path spans three layers:
 
-All new files must have SPDX headers at the very top:
+1. **Zephyr (`soc/ti/k3/am62lx/power.c`)** — implements `pm_state_set()`:
+   - On SMP: broadcasts SGI3 to CPU1 → CPU1 calls `PSCI_CPU_OFF`; CPU0 polls `psci_affinity_info()` until CPU1 is confirmed off.
+   - CPU0 calls `arch_pm_s2ram_suspend()` → saves CPU context to DDR → issues `PSCI_CPU_SUSPEND` (deep sleep power state).
+   - On resume: `arch_pm_s2ram_resume()` restores context; `k_smp_cpu_start(1, ...)` reinitialises and restarts CPU1.
 
-```c
-// SPDX-FileCopyrightText: Copyright The Zephyr Project Contributors
-// SPDX-License-Identifier: Apache-2.0
-```
+2. **TF-A** (external, in `~/ti/trusted-firmware-a`) — receives `CPU_SUSPEND`, gates clocks, puts DDR into self-refresh, powers down A53 cores. On RTC wakeup, powers up A53 and returns to the Zephyr resume path.
 
-Use the file's native comment syntax. "Copyright The Zephyr Project Contributors"
-is the preferred copyright form.
+3. **Zephyr PM device framework** — `CONFIG_PM_DEVICE_SYSTEM_MANAGED` calls `PM_DEVICE_ACTION_TURN_OFF` on all devices before suspend and `PM_DEVICE_ACTION_TURN_ON` after resume. The OMAP I2C driver's `TURN_ON` handler re-programs I2C hardware registers lost when the MAIN power domain is cut.
 
-## Repository Architecture
+Key Kconfig symbols for this flow: `CONFIG_PM`, `CONFIG_PM_S2RAM`, `CONFIG_PM_DEVICE`, `CONFIG_PM_DEVICE_SYSTEM_MANAGED`, `CONFIG_SMP`.
 
-| Directory | Contents |
+## Source Tree Reference
+
+| Path | Contents |
 |---|---|
-| `arch/` | Architecture-specific kernel code (arm, arm64, x86, riscv, xtensa, arc, mips, …) |
-| `boards/` | Board definitions (DTS, Kconfig, cmake) |
-| `drivers/` | Device drivers organized by bus/peripheral type |
-| `dts/` | Devicetree source files and bindings (`bindings/` subdirectory) |
-| `include/zephyr/` | Public API headers |
-| `kernel/` | Architecture-independent kernel (scheduling, IPC, memory) |
-| `lib/` | Libraries (minimal libc, posix, cpp, …) |
-| `samples/` | Sample applications |
-| `scripts/` | Build tooling, CI, twister, checkpatch, west commands |
-| `soc/` | SoC-specific code and Kconfig |
-| `subsys/` | Subsystems: networking, Bluetooth, USB, FS, logging, mgmt, … |
-| `tests/` | Tests and benchmarks (ztest-based) |
-
-### Build System Flow
-
-1. An application's `CMakeLists.txt` calls `find_package(Zephyr)` to pull in Zephyr's build system.
-2. Kconfig runs to produce `.config` from `prj.conf` + board + SoC Kconfig trees.
-3. Devicetree compiler processes `.dts` + overlays into a generated header (`devicetree_generated.h`).
-4. CMake compiles kernel + drivers + subsystems + application into a single ELF.
-5. The `zephyr.elf`/`.bin`/`.hex` outputs live in the build directory.
-
-Syscall stubs are auto-generated from headers annotated with `__syscall`. The
-`arch/` and `soc/` layers provide the platform-specific glue (interrupt
-controllers, MMU, linker scripts, context switching).
-
-### Key Abstractions
-
-- **Kconfig**: software feature selection (compile-time `CONFIG_*` symbols).
-- **Devicetree**: hardware description (runtime `DT_*` macros, `DEVICE_DT_GET`).
-- **Device driver model**: `DEVICE_DEFINE` / `DEVICE_DT_DEFINE` + API structs.
-- **Ztest**: `ZTEST_SUITE` + `ZTEST(suite, test_name)` macros.
-
-## TI AM62L Platform (branch: pr-114)
-
-This branch (`pr-114`) implements S2RAM (suspend-to-RAM / deep-sleep LPM)
-for the TI AM62L EVM (Cortex-A53, arm64). This is the first S2RAM implementation
-for any arm64 board in upstream Zephyr.
-
-### Board-specific build commands
-
-```bash
-# Build the LPM sample for AM62L
-west build -p always -b am62l_evm/am62l3/a53 samples/boards/ti/am62l_lpm
-
-# Build a simple hello-world to test the board toolchain
-west build -p always -b am62l_evm/am62l3/a53 samples/hello_world
-
-# Run compliance on the LPM feature commits
-./scripts/ci/check_compliance.py -c cde0a961d82..HEAD
-
-# Flash / debug via OpenOCD + XDS110 JTAG
-west flash --runner openocd
-west debug --runner openocd
-# Or directly (board.cmake wires --target-handle am62l.cpu.a53.0):
-openocd -f boards/ti/am62l_evm/support/openocd.cfg
-```
-
-Note: `boards/ti/am62l_evm/support/openocd.cfg` is a standalone config that does NOT
-source `ti_k3.cfg` because the AM62L TAP ID (`0x0bba702f`) differs from AM625
-(`0x0bb7e02f`) in PARTNO (not just version nibble), and the AM625 power-AP unlock
-offsets cause bus errors on the external XDS110 when used against AM62L.
-
-### Full firmware stack build (TF-A → U-Boot → Zephyr)
-
-All three components must be built to produce a bootable SD card image.
-The toolchain is at `/opt/arm-gnu-toolchain-15.2.rel1-x86_64-aarch64-none-linux-gnu/`.
-
-#### TF-A
-
-```bash
-cd /home/a0510137local/ti/trusted-firmware-a
-
-# Clean
-make PLAT=k3low TARGET_BOARD=am62lx clean
-
-# Build
-make -j32 \
-  CROSS_COMPILE=/opt/arm-gnu-toolchain-15.2.rel1-x86_64-aarch64-none-linux-gnu/bin/aarch64-none-linux-gnu- \
-  ARCH=aarch64 PLAT=k3low TARGET_BOARD=am62lx
-```
-
-Output: `build/k3low/am62lx/release/bl1.bin` and `bl31.bin`.
-
-#### U-Boot
-
-```bash
-cd /home/a0510137local/ti/ti-u-boot
-
-# Clean
-rm -rf out/a53_am62l
-
-# Configure
-make ARCH=arm \
-  CROSS_COMPILE=/opt/arm-gnu-toolchain-15.2.rel1-x86_64-aarch64-none-linux-gnu/bin/aarch64-none-linux-gnu- \
-  am62lx_evm_defconfig O=out/a53_am62l
-
-# Workaround for pylibfdt _shipped bug
-mkdir -p out/a53_am62l/scripts/dtc/pylibfdt
-cp scripts/dtc/pylibfdt/libfdt.i_shipped out/a53_am62l/scripts/dtc/pylibfdt/libfdt.i
-make ARCH=arm \
-  CROSS_COMPILE=/opt/arm-gnu-toolchain-15.2.rel1-x86_64-aarch64-none-linux-gnu/bin/aarch64-none-linux-gnu- \
-  O=out/a53_am62l scripts/dtc/pylibfdt/
-
-# Build
-make -j32 \
-  CROSS_COMPILE=/opt/arm-gnu-toolchain-15.2.rel1-x86_64-aarch64-none-linux-gnu/bin/aarch64-none-linux-gnu- \
-  ARCH=arm \
-  BL1=/home/a0510137local/ti/trusted-firmware-a/build/k3low/am62lx/release/bl1.bin \
-  BL31=/home/a0510137local/ti/trusted-firmware-a/build/k3low/am62lx/release/bl31.bin \
-  BINMAN_INDIRS=/home/a0510137local/ti/ti-linux-firmware \
-  TEE=/home/a0510137local/Downloads/tee.bin \
-  PYTHONPATH=/home/a0510137local/ti/ti-u-boot/out/a53_am62l/scripts/dtc/pylibfdt \
-  O=out/a53_am62l
-```
-
-#### Deploy
-
-```bash
-# Copy U-Boot artifacts to SD card (mount at /media/a0510137local/boot/)
-cp /home/a0510137local/ti/ti-u-boot/out/a53_am62l/tiboot3.bin \
-   /home/a0510137local/ti/ti-u-boot/out/a53_am62l/tispl.bin \
-   /home/a0510137local/ti/ti-u-boot/out/a53_am62l/u-boot.img \
-   /media/a0510137local/boot/
-sync
-
-# Copy Zephyr binary to tftp server (U-Boot loads via network)
-sudo cp /home/a0510137local/ti/zephyrproject/zephyr/build/zephyr/zephyr.bin /srv/tftp/zephyr.bin
-```
-
-### S2RAM architecture — key files and their roles
-
-The feature is spread across several layers that must all be consistent:
-
-| File | Role |
-|------|------|
-| `arch/Kconfig` | `select ARCH_HAS_SUSPEND_TO_RAM` added to ARM64 — enables `CONFIG_PM_S2RAM` auto-selection |
-| `arch/arm64/core/pm_s2ram.S` | Save/restore callee-saved GPRs (x19–x30) + SP/VBAR_EL1 to `_cpu_context`; `arch_pm_s2ram_resume` is the EL1 re-entry point passed to TF-A via PSCI |
-| `arch/arm64/core/pm_s2ram.c` | `_cpu_context_t` in `__noinit` DDR (sp + vbar_el1); suspend marker (magic `0xDABBAD00`); `pm_s2ram_mark_set` / `pm_s2ram_mark_check_and_clear` |
-| `arch/arm64/core/smp.c` | Resume path fix: when `cpu_map[cpu_num] != INV_MPID` (DDR retained), skip the `cpu_node_list` scan and call `pm_cpu_on` directly — avoids a `k_panic()` on the exhausted iterator |
-| `include/zephyr/arch/arm64/cpu.h` | `_cpu_context_t` struct (sp + vbar_el1); `arch_pm_s2ram_resume` extern (under `CONFIG_PM_S2RAM`) |
-| `soc/ti/k3/am62lx/power.c` | `pm_state_set()` / `pm_state_exit_post_ops()`; SMP CPU1 OFF handshake via SGI3 + `psci_affinity_info()` polling; `am62l_system_off()` calls `psci_system_suspend()` |
-| `soc/ti/k3/common/CMakeLists.txt` | Compiles `power.c` when `CONFIG_SOC_SERIES_AM62LX_A53 && CONFIG_PM_S2RAM` |
-| `drivers/pm_cpu_ops/pm_cpu_ops_psci.c` | New `psci_system_suspend(entry_point)` (PSCI 1.0 SYSTEM_SUSPEND SMC) and `psci_affinity_info()` for SMP polling |
-| `drivers/counter/counter_k3_rtc.c` | K3 RTC counter driver — wakeup alarm, `GENERAL_CTL` unlock sequence (typo `GENRAL_CTL` fixed here), `k3_rtc_lock()`, PM `SUSPEND`/`RESUME` hooks that arm/clear the PMIC power-off bits |
-| `drivers/i2c/i2c_omap.c` | OMAP I2C `PM_DEVICE_ACTION_TURN_ON` hook — re-programs all hardware registers lost when MAIN power domain is cut (calls `i2c_omap_set_speed` + `i2c_omap_init_ll`) |
-| `drivers/serial/uart_ns16550.c` | NS16550 UART PM hooks — on `TURN_ON`, calls `clock_control_on` before `uart_ns16550_configure()` because on TI K3 the configure function accesses MDR1 before its internal clock-enable, racing against a gated clock |
-| `drivers/power_domain/power_domain_arm_scmi.c` | `CONFIG_POWER_DOMAIN_ARM_SCMI_LPM_MANAGED` compile guard — skips Zephyr SCMI power-off/on calls since TF-A/TIFS manages domains during LPM; children still get `TURN_OFF`/`TURN_ON` |
-| `dts/arm64/ti/am62l3_a53.dtsi` | `power-states { rtc_ddr }` node + `cpu-power-states` on both CPUs to wire `suspend-to-ram` into PM policy; RTC interrupt (GIC SPI 28) |
-| `dts/vendor/ti/am62l-wakeup.dtsi` | `wkup_rtc0` node (address `0x2b1f0000`, compat `ti,am62l-rtc`) |
-| `boards/ti/am62l_evm/board.cmake` | `openocd` runner wired to `support/openocd.cfg`, target-handle `am62l.cpu.a53.0` |
-| `boards/ti/am62l_evm/support/openocd.cfg` | Standalone AM62L OpenOCD config (TAP ID `0x0bba702f`); two A53 cores only |
-| `samples/boards/ti/am62l_lpm/` | End-to-end demo: read AT24 EEPROM pre-suspend → arm RTC alarm → force S2RAM → verify EEPROM matches post-resume (proves I2C TURN_ON worked) |
-
-### Suspend call chain (CPU0)
-
-```
-pm_state_set(S2RAM)
-  → [SMP] signal CPU1 via SGI3 → CPU1 calls pm_cpu_off() (PSCI CPU_OFF)
-  → [SMP] CPU0 polls psci_affinity_info(CPU1_MPIDR) until AFF_STATE_OFF
-  → arch_pm_s2ram_suspend(am62l_system_off)   [pm_s2ram.S]
-    → save x19–x30 on stack, SP + VBAR_EL1 to _cpu_context
-    → pm_s2ram_mark_set()  (write 0xDABBAD00 to __noinit DDR)
-    → am62l_system_off()
-      → psci_system_suspend(arch_pm_s2ram_resume)  ← SYSTEM_SUSPEND not CPU_SUSPEND
-        → SMC → TF-A EL3 → TIFS: DDR self-refresh, A53 power-down
-
-[RTC alarm fires]
-TF-A EL3 → restore EL1 sysregs → ERET to arch_pm_s2ram_resume
-  → restore VBAR_EL1 + SP from _cpu_context (before any C call)
-  → pm_s2ram_mark_check_and_clear()
-  → pop x19–x30 from DDR-retained stack
-  → return x0=0 to arch_pm_s2ram_suspend call site
-pm_state_exit_post_ops()  → irq_unlock(0)
-  → [SMP] k_smp_cpu_resume(1) → PSCI CPU_ON cold-boots CPU1
-```
-
-### SMP behaviour
-
-CPU1 shutdown/resume is controlled by `soc_per_core_init_hook()` (called by
-`arch_secondary_cpu_init()` after GIC init) and `am62l_s2ram_cpu1_ipi()` (SGI3
-handler):
-
-- CPU1 runs `pm_cpu_off()` (PSCI CPU_OFF)
-- CPU0 polls `psci_affinity_info()` until AFF_STATE_OFF
-- On resume `k_smp_cpu_resume()` cold-boots CPU1 via PSCI CPU_ON
-
-**`arch/arm64/core/smp.c` resume path fix:** `arch_cpu_start()` (called by
-`k_smp_cpu_resume`) was written for cold-boot only: it scanned
-`cpu_node_list[]` using a static iterator `i`, which is exhausted after first
-boot, causing a `k_panic()` on the second call. The fix checks
-`cpu_map[cpu_num] != INV_MPID` first — if the MPID is already known (DDR
-retained it across self-refresh), skip the scan and call `pm_cpu_on` directly.
-
-### PM-relevant Kconfig symbols
-
-| Symbol | Where set | Meaning |
-|--------|-----------|---------|
-| `CONFIG_PM` | defconfig | Enable PM subsystem |
-| `CONFIG_PM_S2RAM` | auto (Kconfig) | Auto-selected when `ARCH_HAS_SUSPEND_TO_RAM` + DT power-state present |
-| `CONFIG_PM_DEVICE_SYSTEM_MANAGED` | defconfig | Kernel calls TURN_OFF/TURN_ON on all devices around suspend |
-| `CONFIG_POWER_DOMAIN_ARM_SCMI_LPM_MANAGED` | defconfig | Skip Zephyr SCMI power-off calls — TF-A/TIFS manages domains during LPM |
-
-### AM62L LPM modes
-
-S2RAM uses **deep sleep** (`TI_K3_SLEEP_MODE_DEEP_SLEEP = 0x0`): A53 cluster
-powered off, DDR retained in self-refresh, all standard wakeup sources active.
-
-| TIFS mode value | Name | Description |
-|---|---|---|
-| `0x0` | `DEEP_SLEEP` | S2RAM — A53 off, DDR retained, all wakeup sources |
-| `0x6` | `RTC_PLUS_DDR` | A53 off, DDR retained, RTC wakeup only |
-| `0x7` | `RTC_ONLY` | Most aggressive — DDR not retained |
-| `0xFF` | `INVALID` | Sentinel — never passed to TIFS |
-
-**GIC ITS context on resume:** Zephyr calls `psci_system_suspend()` directly
-without modifying TF-A's `am62l_lpm_state` — that variable is used by the
-S2Idle path in Linux, which is not exercised here. TF-A selects the LPM mode
-via its own internal `mode` variable. However, TF-A gates `k3_gic_its_save()`
-on `am62l_lpm_state != INVALID`, which means GIC ITS context is not saved by
-TF-A on the Zephyr path. Zephyr must therefore save and restore GIC ITS
-context itself around `psci_system_suspend()`.
+| `arch/arm64/` | ARM64 arch code including `arch_pm_s2ram_suspend/resume` |
+| `boards/ti/am62l_evm/` | AM62L EVM board DTS, defconfig, pinctrl |
+| `drivers/` | Device drivers (I2C, counter/RTC, EEPROM, …) |
+| `dts/arm64/ti/` | AM62L devicetree source |
+| `include/zephyr/pm/` | PM framework public API headers |
+| `kernel/` | Core kernel (scheduler, SMP, idle thread) |
+| `samples/boards/ti/am62l_lpm/` | Active LPM sample application |
+| `soc/ti/k3/am62lx/` | AM62L SoC code (power.c, Kconfig) |
+| `subsys/pm/` | Zephyr PM subsystem implementation |
