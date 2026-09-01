@@ -71,6 +71,17 @@ static void am62l_s2ram_cpu1_ipi(const void *arg)
 	if (atomic_get(&s2ram_cpu1_req)) {
 		printk("CPU1: SGI3 ISR: calling pm_cpu_off\n");
 		/*
+		 * pm_cpu_off()'s SMC never returns on success, so
+		 * isr_wrapper.S never reaches its post-ISR arm_gic_eoi()
+		 * call for this INTID.  SGI3 would stay latched Active at
+		 * the redistributor forever (GICv3: an Active interrupt
+		 * cannot be re-presented to the CPU interface until it is
+		 * deactivated), so the *next* cycle's SGI3 assertion would
+		 * only ever reach Pending and never be delivered.  Deactivate
+		 * it manually here, before the point of no return.
+		 */
+		arm_gic_eoi(SGI_S2RAM_IPI);
+		/*
 		 * Power CPU1 off entirely.  TF-A sets aff_info_state = OFF
 		 * on CPU_OFF, allowing CPU0 to use psci_affinity_info().
 		 * This SMC never returns on success.
@@ -189,7 +200,16 @@ void pm_state_exit_post_ops(enum pm_state state, uint8_t substate_id)
 {
 	ARG_UNUSED(substate_id);
 
-	if (state == PM_STATE_SUSPEND_TO_RAM) {
+	/*
+	 * Only CPU0 actually drives S2RAM and saves/restores the timer
+	 * (see pm_state_set).  The PM framework still calls this hook on
+	 * CPU1 with state == PM_STATE_SUSPEND_TO_RAM (its pending exit
+	 * state was latched before the guard redirected it to k_cpu_idle()),
+	 * so without this CPU0 check CPU1 would overwrite its own live
+	 * CNTV_CTL_EL0/CNTV_CVAL_EL0 with CPU0's stale (zero-initialized)
+	 * saved values, disabling CPU1's tick from the first guard cycle on.
+	 */
+	if (state == PM_STATE_SUSPEND_TO_RAM && arch_curr_cpu()->id == 0U) {
 		/*
 		 * Restore the ARM arch timer registers saved before suspend.
 		 * CVAL is written before CTL so the compare value is in place
