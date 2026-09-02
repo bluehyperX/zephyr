@@ -492,12 +492,31 @@ static int k3_rtc_pm_action(const struct device *dev, enum pm_device_action acti
 			return ret;
 		}
 
+		/*
+		 * Re-arm wakeup enable before poweroff.  PM_DEVICE_ACTION_RESUME
+		 * clears this field; without re-arming it here the peripheral
+		 * cannot assert the wakeup signal on cycle 2+.  Mirrors Linux
+		 * k3rtc_analog_suspend().
+		 */
+		rtc_regs->GENERAL_CTL |= RTC_WKUP_EN_MASK;
+
+		ret = k3_rtc_fence(dev);
+		if (ret != 0) {
+			LOG_ERR("Failed to fence WKUP_EN: %d", ret);
+			return ret;
+		}
+
 		/* Enable software poweroff */
 		rtc_regs->GENERAL_CTL |= RTC_GEN_SW_OFF_MASK;
 
 		ret = k3_rtc_fence(dev);
 		if (ret != 0) {
 			LOG_ERR("Failed to fence SW_OFF: %d", ret);
+			return ret;
+		}
+
+		ret = k3_rtc_lock(dev);
+		if (ret != 0) {
 			return ret;
 		}
 

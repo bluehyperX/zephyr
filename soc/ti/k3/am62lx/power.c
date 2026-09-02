@@ -215,19 +215,21 @@ void pm_state_exit_post_ops(enum pm_state state, uint8_t substate_id)
 		 * CVAL is written before CTL so the compare value is in place
 		 * before the timer is re-enabled.
 		 *
-		 * The restore must be a direct write, not read-modify-write:
-		 * the power-domain reset left CNTV_CTL_EL0 = 0x2 (IMASK=1).
-		 * Restoring the saved value (0x1: ENABLE=1, IMASK=0) clears
-		 * IMASK.  An OR-based enable would keep IMASK=1 and suppress
-		 * the interrupt even with ENABLE=1.
-		 *
-		 * The saved CVAL is always in the past after a multi-second
-		 * suspend, so the interrupt fires immediately once IRQs are
-		 * unmasked by irq_unlock() below.  The timer ISR announces all
-		 * elapsed ticks via sys_clock_announce(), unblocking k_msleep.
+		 * Force IMASK=0 (bit 1) regardless of the saved value.  In
+		 * tickless mode the timer ISR sets IMASK=1 before announcing
+		 * ticks; sys_clock_set_timeout() clears it when programming the
+		 * next event.  If the save in pm_state_set() captured CNTV_CTL
+		 * between ISR (IMASK=1) and sys_clock_set_timeout() (IMASK=0),
+		 * the saved value has IMASK=1.  Restoring that value faithfully
+		 * would leave the timer permanently masked after resume, causing
+		 * k_msleep() and all timeout-dependent code to hang forever.
+		 * Stripping IMASK here is always safe: CVAL is in the past after
+		 * a multi-second suspend, so the ISR fires immediately once IRQs
+		 * are unmasked by irq_unlock() below and sys_clock_announce()
+		 * unblocks any pending timeouts.
 		 */
 		write_sysreg(s2ram_cntv_cval, cntv_cval_el0);
-		write_sysreg(s2ram_cntv_ctl,  cntv_ctl_el0);
+		write_sysreg(s2ram_cntv_ctl & ~2ULL, cntv_ctl_el0);
 	}
 
 	irq_unlock(0);
