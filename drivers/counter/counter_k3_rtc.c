@@ -92,13 +92,21 @@ static int k3_rtc_fence(const struct device *dev)
 	k3_rtc_regs_t *rtc_regs = DEV_REGS(dev);
 	struct k3_rtc_counter_data *data = DEV_DATA(dev);
 
-	/* Add slight delay in order to wait for register writes to sync */
-	k_usleep(data->sync_timeout_us);
-	int timeout = WAIT_FOR((rtc_regs->SYNCPEND & RTC_SYNCPEND_STATUS_MASK) != 0,
-				data->sync_timeout_us,
-				k_busy_wait(1));
+	/*
+	 * Add slight delay in order to wait for register writes to sync.
+	 * k_busy_wait() (not k_usleep()) so this is also safe to call from
+	 * k3_rtc_isr(), which needs the same sync delay before touching
+	 * IRQSTATUS_SYS.
+	 */
+	k_busy_wait(data->sync_timeout_us);
 
-	return timeout;
+	if (!WAIT_FOR((rtc_regs->SYNCPEND & RTC_SYNCPEND_STATUS_MASK) == 0,
+		      data->sync_timeout_us,
+		      k_busy_wait(1))) {
+		return -EIO;
+	}
+
+	return 0;
 }
 
 static int k3_rtc_unlock_status(k3_rtc_regs_t *rtc_regs)
@@ -134,14 +142,12 @@ static int k3_rtc_lock(const struct device *dev)
 {
 	k3_rtc_regs_t *rtc_regs = DEV_REGS(dev);
 	struct k3_rtc_counter_data *data = DEV_DATA(dev);
-	int ret;
 
 	rtc_regs->KICK0 = 0x0;
 
-	ret = WAIT_FOR(k3_rtc_unlock_status(rtc_regs) == 0,
-		       data->sync_timeout_us,
-		       k_busy_wait(1));
-	if (ret != 0) {
+	if (!WAIT_FOR(k3_rtc_unlock_status(rtc_regs) == 0,
+		      data->sync_timeout_us,
+		      k_busy_wait(1))) {
 		LOG_ERR("RTC lock failed!");
 		return -EIO;
 	}
@@ -181,6 +187,11 @@ static int k3_counter_set_value(const struct device *dev, uint32_t ticks)
 	k3_rtc_regs_t *rtc_regs = DEV_REGS(dev);
 	int ret;
 
+	ret = k3_rtc_unlock(dev);
+	if (ret != 0) {
+		return ret;
+	}
+
 	rtc_regs->S_CNT_LSW = ticks;
 	rtc_regs->S_CNT_MSW = 0;
 
@@ -190,7 +201,7 @@ static int k3_counter_set_value(const struct device *dev, uint32_t ticks)
 		return ret;
 	}
 
-	return 0;
+	return k3_rtc_lock(dev);
 }
 
 static int k3_counter_reset(const struct device *dev)
@@ -237,6 +248,12 @@ static int k3_counter_set_alarm(const struct device *dev, uint8_t chan_id,
 
 	key = irq_lock();
 
+	ret = k3_rtc_unlock(dev);
+	if (ret != 0) {
+		irq_unlock(key);
+		return ret;
+	}
+
 	if (chan_id == 0) {
 		rtc_regs->ON_OFF_S_CNT_LSW = (uint32_t)data->alarm_cfg[chan_id].ticks;
 		rtc_regs->ON_OFF_S_CNT_MSW = 0;
@@ -251,6 +268,12 @@ static int k3_counter_set_alarm(const struct device *dev, uint8_t chan_id,
 	ret = k3_rtc_fence(dev);
 	if (ret != 0) {
 		LOG_ERR("Failed to sync after alarm set: %d", ret);
+		irq_unlock(key);
+		return ret;
+	}
+
+	ret = k3_rtc_lock(dev);
+	if (ret != 0) {
 		irq_unlock(key);
 		return ret;
 	}
@@ -275,6 +298,13 @@ static int k3_counter_cancel_alarm(const struct device *dev, uint8_t chan_id)
 	}
 
 	key = irq_lock();
+
+	ret = k3_rtc_unlock(dev);
+	if (ret != 0) {
+		irq_unlock(key);
+		return ret;
+	}
+
 	if (chan_id == 0) {
 		rtc_regs->IRQENABLE_CLR_SYS = RTC_IRQ_ALARM1_MASK;
 		rtc_regs->IRQSTATUS_SYS = RTC_IRQ_ALARM1_MASK;
@@ -285,6 +315,12 @@ static int k3_counter_cancel_alarm(const struct device *dev, uint8_t chan_id)
 	ret = k3_rtc_fence(dev);
 	if (ret != 0) {
 		LOG_ERR("Failed to sync after alarm cancel: %d", ret);
+		irq_unlock(key);
+		return ret;
+	}
+
+	ret = k3_rtc_lock(dev);
+	if (ret != 0) {
 		irq_unlock(key);
 		return ret;
 	}
@@ -340,6 +376,11 @@ static int k3_counter_set_value_64(const struct device *dev, uint64_t ticks)
 	k3_rtc_regs_t *rtc_regs = DEV_REGS(dev);
 	int ret;
 
+	ret = k3_rtc_unlock(dev);
+	if (ret != 0) {
+		return ret;
+	}
+
 	rtc_regs->S_CNT_LSW = ticks;
 	rtc_regs->S_CNT_MSW = (uint32_t)(ticks >> 32);
 
@@ -349,7 +390,7 @@ static int k3_counter_set_value_64(const struct device *dev, uint64_t ticks)
 		return ret;
 	}
 
-	return 0;
+	return k3_rtc_lock(dev);
 }
 
 static uint64_t k3_counter_get_top_value_64(const struct device *dev)
@@ -389,6 +430,12 @@ static int k3_counter_set_alarm_64(const struct device *dev, uint8_t chan_id,
 
 	key = irq_lock();
 
+	ret = k3_rtc_unlock(dev);
+	if (ret != 0) {
+		irq_unlock(key);
+		return ret;
+	}
+
 	if (chan_id == 0) {
 		rtc_regs->ON_OFF_S_CNT_LSW = (uint32_t)data->alarm_cfg[chan_id].ticks;
 		rtc_regs->ON_OFF_S_CNT_MSW = (uint32_t)(data->alarm_cfg[chan_id].ticks >> 32);
@@ -403,6 +450,12 @@ static int k3_counter_set_alarm_64(const struct device *dev, uint8_t chan_id,
 	ret = k3_rtc_fence(dev);
 	if (ret != 0) {
 		LOG_ERR("Failed to sync after alarm set: %d", ret);
+		irq_unlock(key);
+		return ret;
+	}
+
+	ret = k3_rtc_lock(dev);
+	if (ret != 0) {
 		irq_unlock(key);
 		return ret;
 	}
@@ -429,12 +482,75 @@ static void k3_rtc_isr(const struct device *dev)
 	uint32_t now;
 #endif /* CONFIG_COUNTER_64BITS_TICKS */
 
+	/*
+	 * Erratum i2327: IRQ assertion is fast, but IRQSTATUS_SYS only
+	 * de-asserts on a 32k-domain clock edge. Touching the status
+	 * register before that edge leaves the bit clearable but the
+	 * (level-triggered) GIC line still asserted, so the ISR retriggers
+	 * indefinitely instead of returning. Wait out one sync period
+	 * before reading/clearing anything, mirroring the Linux driver.
+	 */
+	k_busy_wait(data->sync_timeout_us);
+
 	status = rtc_regs->IRQSTATUS_SYS;
 	if (status == 0) {
 		return;
 	}
 
+	LOG_DBG("ISR entry: status=0x%x raw=0x%x general_ctl=0x%x",
+		status, rtc_regs->IRQSTATUS_RAW_SYS, rtc_regs->GENERAL_CTL);
+
+	/*
+	 * The RTC sits locked at rest, which is the state it is in when a
+	 * real hardware alarm fires. Writes to IRQSTATUS_SYS/SYNCPEND below
+	 * are silently dropped by the KICK-lock gate unless unlocked first.
+	 */
+	if (k3_rtc_unlock(dev) != 0) {
+		LOG_ERR("Failed to unlock RTC in ISR");
+		return;
+	}
+
+	LOG_DBG("ISR: unlocked, general_ctl=0x%x", rtc_regs->GENERAL_CTL);
+
 	rtc_regs->IRQSTATUS_SYS = status;
+
+	if (k3_rtc_fence(dev) != 0) {
+		LOG_ERR("Failed to fence IRQ status clear");
+	}
+
+	LOG_DBG("ISR: after status clear, status=0x%x syncpend=0x%x",
+		rtc_regs->IRQSTATUS_SYS, rtc_regs->SYNCPEND);
+
+	/*
+	 * Force a 32k-domain reload so the cleared status actually
+	 * propagates before the GIC re-samples the line.
+	 */
+	rtc_regs->SYNCPEND = RTC_RELOAD_FROM_BBD;
+
+	if (k3_rtc_fence(dev) != 0) {
+		LOG_ERR("Failed to fence reload from BBD");
+	}
+
+	LOG_DBG("ISR: after BBD reload, status=0x%x syncpend=0x%x",
+		rtc_regs->IRQSTATUS_SYS, rtc_regs->SYNCPEND);
+
+	/*
+	 * Confirm the status actually cleared before re-locking and
+	 * dispatching callbacks. If it didn't, the GIC line is still
+	 * asserted and letting the ISR return would retrigger indefinitely.
+	 */
+	if (!WAIT_FOR((rtc_regs->IRQSTATUS_SYS & RTC_IRQ_STATUS_ALL_MASK) == 0,
+		      data->sync_timeout_us, k_busy_wait(2))) {
+		LOG_ERR("IRQ status failed to clear, status=0x%x raw=0x%x",
+			rtc_regs->IRQSTATUS_SYS, rtc_regs->IRQSTATUS_RAW_SYS);
+		return;
+	}
+
+	if (k3_rtc_lock(dev) != 0) {
+		LOG_ERR("Failed to lock RTC in ISR");
+	}
+
+	LOG_DBG("ISR: confirmed clear, dispatching (general_ctl=0x%x)", rtc_regs->GENERAL_CTL);
 
 	if ((status & RTC_IRQ_ALARM1_MASK) != 0 && data->alarm_cfg[0].callback != NULL) {
 #ifdef CONFIG_COUNTER_64BITS_TICKS
@@ -468,6 +584,8 @@ static int k3_rtc_pm_action(const struct device *dev, enum pm_device_action acti
 
 	switch (action) {
 	case PM_DEVICE_ACTION_SUSPEND:
+		LOG_DBG("PM SUSPEND entry: general_ctl=0x%x", rtc_regs->GENERAL_CTL);
+
 		ret = k3_rtc_unlock(dev);
 		if (ret != 0) {
 			return ret;
@@ -520,6 +638,8 @@ static int k3_rtc_pm_action(const struct device *dev, enum pm_device_action acti
 			return ret;
 		}
 
+		LOG_DBG("PM SUSPEND exit: general_ctl=0x%x", rtc_regs->GENERAL_CTL);
+
 		return 0;
 
 	case PM_DEVICE_ACTION_RESUME:
@@ -529,6 +649,10 @@ static int k3_rtc_pm_action(const struct device *dev, enum pm_device_action acti
 		 * poweroff configuration. If not set, RTC lost context and
 		 * k3_counter_init() will reconfigure it.
 		 */
+		LOG_DBG("PM RESUME entry: general_ctl=0x%x pwr_off_retained=%d",
+			rtc_regs->GENERAL_CTL,
+			!!(rtc_regs->GENERAL_CTL & RTC_GEN_PWR_OFF_MASK));
+
 		if (!(rtc_regs->GENERAL_CTL & RTC_GEN_PWR_OFF_MASK)) {
 			return 0;
 		}
@@ -598,6 +722,9 @@ static int k3_rtc_pm_action(const struct device *dev, enum pm_device_action acti
 		intr_src = rtc_regs->IRQSTATUS_RAW_SYS & RTC_IRQ_STATUS_ALL_MASK;
 		rtc_regs->IRQSTATUS_SYS = intr_src;
 
+		LOG_DBG("PM RESUME: intr_src=0x%x raw=0x%x status=0x%x",
+			intr_src, rtc_regs->IRQSTATUS_RAW_SYS, rtc_regs->IRQSTATUS_SYS);
+
 		/* Clear power-off enable that was set during suspend */
 		rtc_regs->GENERAL_CTL &= ~RTC_GEN_PWR_OFF_MASK;
 
@@ -627,6 +754,9 @@ static int k3_rtc_pm_action(const struct device *dev, enum pm_device_action acti
 		if (ret != 0) {
 			return ret;
 		}
+
+		LOG_DBG("PM RESUME exit: general_ctl=0x%x syncpend=0x%x status=0x%x",
+			rtc_regs->GENERAL_CTL, rtc_regs->SYNCPEND, rtc_regs->IRQSTATUS_SYS);
 
 		return 0;
 

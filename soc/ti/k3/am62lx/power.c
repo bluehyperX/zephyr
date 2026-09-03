@@ -102,7 +102,7 @@ void soc_per_core_init_hook(void)
 	 * redistributor is configured and IGRPMODR=0xFFFF (Group 1 NS).
 	 * Enable SGI3 so CPU0 can signal CPU1 to power itself off.
 	 */
-	printk("CPU1: soc_per_core_init_hook: enabling SGI3\n");
+	// printk("CPU1: soc_per_core_init_hook: enabling SGI3\n");
 	irq_enable(SGI_S2RAM_IPI);
 }
 #endif /* CONFIG_SMP */
@@ -200,6 +200,9 @@ void pm_state_exit_post_ops(enum pm_state state, uint8_t substate_id)
 {
 	ARG_UNUSED(substate_id);
 
+	/* TEMP DIAG */
+	printk("post_ops: enter state=%d cpu=%u\n", state, arch_curr_cpu()->id);
+
 	/*
 	 * Only CPU0 actually drives S2RAM and saves/restores the timer
 	 * (see pm_state_set).  The PM framework still calls this hook on
@@ -230,9 +233,19 @@ void pm_state_exit_post_ops(enum pm_state state, uint8_t substate_id)
 		 */
 		write_sysreg(s2ram_cntv_cval, cntv_cval_el0);
 		write_sysreg(s2ram_cntv_ctl & ~2ULL, cntv_ctl_el0);
+
+		/* TEMP DIAG */
+		printk("post_ops: saved_ctl=0x%llx saved_cval=0x%llx "
+		       "readback_ctl=0x%llx readback_cval=0x%llx cntvct=0x%llx\n",
+		       s2ram_cntv_ctl, s2ram_cntv_cval,
+		       read_sysreg(cntv_ctl_el0), read_sysreg(cntv_cval_el0),
+		       read_sysreg(cntvct_el0));
 	}
 
+	/* TEMP DIAG */
+	printk("post_ops: about to irq_unlock, cpu=%u\n", arch_curr_cpu()->id);
 	irq_unlock(0);
+	printk("post_ops: irq_unlock done, cpu=%u\n", arch_curr_cpu()->id);
 }
 
 #ifdef CONFIG_SMP

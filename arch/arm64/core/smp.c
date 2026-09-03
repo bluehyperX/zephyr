@@ -170,7 +170,7 @@ FUNC_NORETURN void arch_secondary_cpu_init(void)
 	write_tpidrro_el0((uintptr_t)&_kernel.cpus[cpu_num]);
 
 	z_arm64_mm_init(false);
-	printk("CPU%d: MMU init done\n", cpu_num);
+	// printk("CPU%d: MMU init done\n", cpu_num);
 
 #ifdef CONFIG_ARM64_SAFE_EXCEPTION_STACK
 	z_arm64_safe_exception_stack_init();
@@ -178,7 +178,7 @@ FUNC_NORETURN void arch_secondary_cpu_init(void)
 
 #ifdef CONFIG_SMP
 	arm_gic_secondary_init();
-	printk("CPU%d: GIC init done\n", cpu_num);
+	// printk("CPU%d: GIC init done\n", cpu_num);
 
 	irq_enable(SGI_SCHED_IPI);
 #ifdef CONFIG_USERSPACE
@@ -195,7 +195,7 @@ FUNC_NORETURN void arch_secondary_cpu_init(void)
 	arg = arm64_cpu_boot_params.arg;
 	barrier_dsync_fence_full();
 
-	printk("CPU%d: signalling ready, entering scheduler\n", cpu_num);
+	// printk("CPU%d: signalling ready, entering scheduler\n", cpu_num);
 
 	/*
 	 * Secondary core clears .fn to announce its presence.
