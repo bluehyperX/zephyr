@@ -48,12 +48,47 @@
 #include <zephyr/drivers/pm_cpu_ops.h>
 #include <zephyr/drivers/interrupt_controller/gic.h>
 #include <zephyr/kernel/smp.h>
+#include <zephyr/sys/sys_io.h>
 
 /* SGI3 is unallocated in smp.c (0=SCHED, 1=MMCFG, 2=FPU) */
 #define SGI_S2RAM_IPI           3
 
 /* CPU1 MPIDR: Aff0=1, all higher affinity levels 0 */
 #define CPU1_MPIDR              0x1ULL
+
+/*
+ * ARM virtual timer PPI on GICv3.  Redistributor register offsets are
+ * private to intc_gicv3.c; redefine the ones needed here for diagnostics.
+ * gic_rdists[] is exported (non-static) by intc_gicv3.c but has no public
+ * declaration, so it is externed directly.
+ */
+#define VTIMER_INTID            27U
+#define GICR_SGI_BASE_OFF       0x10000UL
+#define GICR_IGROUPR0_OFF       0x0080UL
+#define GICR_ISACTIVER0_OFF     0x0300UL
+#define GICR_ICFGR0_OFF         0x0c00UL
+#define GICR_IGRPMODR0_OFF      0x0d00UL
+
+extern mem_addr_t gic_rdists[CONFIG_MP_MAX_NUM_CPUS];
+
+static void am62l_dump_vtimer_gic_state(const char *tag)
+{
+	mem_addr_t sgi_base = gic_rdists[arch_curr_cpu()->id] + GICR_SGI_BASE_OFF;
+	uint32_t igroupr = sys_read32(sgi_base + GICR_IGROUPR0_OFF);
+	uint32_t igrpmodr = sys_read32(sgi_base + GICR_IGRPMODR0_OFF);
+	uint32_t isactiver = sys_read32(sgi_base + GICR_ISACTIVER0_OFF);
+	uint32_t icfgr0 = sys_read32(sgi_base + GICR_ICFGR0_OFF);
+
+	printk("%s: vtimer(intid=%u) enabled=%d pending=%d "
+	       "group=%d grpmod=%d active=%d cfg=%d\n",
+	       tag, VTIMER_INTID,
+	       arm_gic_irq_is_enabled(VTIMER_INTID),
+	       arm_gic_irq_is_pending(VTIMER_INTID),
+	       (igroupr >> VTIMER_INTID) & 1U,
+	       (igrpmodr >> VTIMER_INTID) & 1U,
+	       (isactiver >> VTIMER_INTID) & 1U,
+	       (icfgr0 >> ((VTIMER_INTID % 16U) * 2U)) & 3U);
+}
 
 /*
  * PSCI AFFINITY_INFO raw return values (PSCI spec table 11).
@@ -69,7 +104,7 @@ static void am62l_s2ram_cpu1_ipi(const void *arg)
 {
 	ARG_UNUSED(arg);
 	if (atomic_get(&s2ram_cpu1_req)) {
-		printk("CPU1: SGI3 ISR: calling pm_cpu_off\n");
+		// printk("CPU1: SGI3 ISR: calling pm_cpu_off\n");
 		/*
 		 * pm_cpu_off()'s SMC never returns on success, so
 		 * isr_wrapper.S never reaches its post-ISR arm_gic_eoi()
@@ -153,15 +188,15 @@ void pm_state_set(enum pm_state state, uint8_t substate_id)
 		 * calls PSCI CPU_OFF.  TF-A updates aff_info_state = OFF so
 		 * psci_affinity_info() detects completion.
 		 */
-		printk("CPU0: sending SGI3 to CPU1\n");
+		// printk("CPU0: sending SGI3 to CPU1\n");
 		atomic_set(&s2ram_cpu1_req, 1);
 		gic_raise_sgi(SGI_S2RAM_IPI, CPU1_MPIDR, 1U << 1);
 
-		printk("CPU0: polling affinity_info for CPU1\n");
+		// printk("CPU0: polling affinity_info for CPU1\n");
 		while (psci_affinity_info(CPU1_MPIDR, 0) == PSCI_AFF_STATE_ON) {
 			k_busy_wait(100);
 		}
-		printk("CPU0: CPU1 is off\n");
+		// printk("CPU0: CPU1 is off\n");
 #endif
 		/*
 		 * Save CPU0 context and call PSCI_SYSTEM_SUSPEND.
@@ -169,8 +204,15 @@ void pm_state_set(enum pm_state state, uint8_t substate_id)
 		 */
 		s2ram_cntv_cval = read_sysreg(cntv_cval_el0);
 		s2ram_cntv_ctl  = read_sysreg(cntv_ctl_el0);
+		/* TEMP DIAG */
+		printk("pm_state_set: pre-suspend cval=0x%llx ctl=0x%llx cntvct=0x%llx\n",
+		       s2ram_cntv_cval, s2ram_cntv_ctl, read_sysreg(cntvct_el0));
+		am62l_dump_vtimer_gic_state("pre-suspend");
 		arch_pm_s2ram_suspend(am62l_system_off);
-		printk("pm_state_set: resumed from S2RAM\n");
+		/* TEMP DIAG */
+		printk("pm_state_set: resumed from S2RAM, cntvct=0x%llx\n",
+		       read_sysreg(cntvct_el0));
+		am62l_dump_vtimer_gic_state("post-resume");
 #ifdef CONFIG_SMP
 		/*
 		 * CPU1 was powered off via PSCI CPU_OFF before suspend.
@@ -180,9 +222,9 @@ void pm_state_set(enum pm_state state, uint8_t substate_id)
 		 * that left IGROUPR=0 (Group 0 / FIQ) on the redistributor.
 		 */
 		atomic_set(&s2ram_cpu1_req, 0);
-		printk("CPU0: starting CPU1 via k_smp_cpu_start\n");
+		// printk("CPU0: starting CPU1 via k_smp_cpu_start\n");
 		k_smp_cpu_start(1, NULL, NULL);
-		printk("CPU0: k_smp_cpu_start done\n");
+		// printk("CPU0: k_smp_cpu_start done\n");
 #endif
 		break;
 
@@ -201,7 +243,7 @@ void pm_state_exit_post_ops(enum pm_state state, uint8_t substate_id)
 	ARG_UNUSED(substate_id);
 
 	/* TEMP DIAG */
-	printk("post_ops: enter state=%d cpu=%u\n", state, arch_curr_cpu()->id);
+	// printk("post_ops: enter state=%d cpu=%u\n", state, arch_curr_cpu()->id);
 
 	/*
 	 * Only CPU0 actually drives S2RAM and saves/restores the timer
@@ -236,16 +278,22 @@ void pm_state_exit_post_ops(enum pm_state state, uint8_t substate_id)
 
 		/* TEMP DIAG */
 		printk("post_ops: saved_ctl=0x%llx saved_cval=0x%llx "
-		       "readback_ctl=0x%llx readback_cval=0x%llx cntvct=0x%llx\n",
+		       "readback_ctl=0x%llx readback_cval=0x%llx cntvct=0x%llx "
+		       "(cval-cntvct=%lld)\n",
 		       s2ram_cntv_ctl, s2ram_cntv_cval,
 		       read_sysreg(cntv_ctl_el0), read_sysreg(cntv_cval_el0),
-		       read_sysreg(cntvct_el0));
+		       read_sysreg(cntvct_el0),
+		       (int64_t)(read_sysreg(cntv_cval_el0) - read_sysreg(cntvct_el0)));
+		am62l_dump_vtimer_gic_state("post_ops-pre-unlock");
 	}
 
 	/* TEMP DIAG */
-	printk("post_ops: about to irq_unlock, cpu=%u\n", arch_curr_cpu()->id);
+	// printk("post_ops: about to irq_unlock, cpu=%u\n", arch_curr_cpu()->id);
 	irq_unlock(0);
-	printk("post_ops: irq_unlock done, cpu=%u\n", arch_curr_cpu()->id);
+	// printk("post_ops: irq_unlock done, cpu=%u\n", arch_curr_cpu()->id);
+	if (state == PM_STATE_SUSPEND_TO_RAM && arch_curr_cpu()->id == 0U) {
+		am62l_dump_vtimer_gic_state("post_ops-post-unlock");
+	}
 }
 
 #ifdef CONFIG_SMP

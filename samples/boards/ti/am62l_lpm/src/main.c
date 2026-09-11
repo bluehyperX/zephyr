@@ -110,13 +110,13 @@ int main(void)
 		pm_state_force(0U,
 			&(struct pm_state_info){PM_STATE_SUSPEND_TO_RAM, 0, 0});
 
+		LOG_INF("Going into S2RAM...");
 		/*
 		 * Yield: idle thread consumes the forced state and calls
 		 * pm_state_set(S2RAM).  Returns here after full resume and
 		 * PM_DEVICE_ACTION_TURN_ON has been issued to all devices.
 		 */
-		LOG_INF("Going into S2RAM...");
-		k_msleep((WAKE_DELAY_S * 2U) * MSEC_PER_SEC);
+		k_msleep((WAKE_DELAY_S * 3U) * MSEC_PER_SEC);
 		LOG_INF("Resumed from S2RAM (DDR-retained counter: %u)", cycles);
 	}
 
