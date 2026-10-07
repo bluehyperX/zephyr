@@ -62,6 +62,18 @@ static uint64_t cpu_map[CONFIG_MP_MAX_NUM_CPUS] = {
 	[0 ... (CONFIG_MP_MAX_NUM_CPUS - 1)] = INV_MPID
 };
 
+/* Publish the target MPID to the secondary core before pm_cpu_on(). */
+static void publish_boot_mpid(uint64_t mpid)
+{
+	barrier_dsync_fence_full();
+
+	/* store mpid last as this is our synchronization point */
+	arm64_cpu_boot_params.mpid = mpid;
+
+	sys_cache_data_flush_range((void *)&arm64_cpu_boot_params,
+				   sizeof(arm64_cpu_boot_params));
+}
+
 /* Called from Zephyr initialization */
 void arch_cpu_start(int cpu_num, k_thread_stack_t *stack, int sz,
 		    arch_cpustart_t fn, void *arg)
@@ -98,21 +110,12 @@ void arch_cpu_start(int cpu_num, k_thread_stack_t *stack, int sz,
 	 */
 	if (cpu_map[cpu_num] != INV_MPID) {
 		cpu_mpid = cpu_map[cpu_num];
-		barrier_dsync_fence_full();
-		arm64_cpu_boot_params.mpid = cpu_mpid;
-		sys_cache_data_flush_range((void *)&arm64_cpu_boot_params,
-					   sizeof(arm64_cpu_boot_params));
+		publish_boot_mpid(cpu_mpid);
 		if (pm_cpu_on(cpu_mpid, (uint64_t)&__start)) {
 			printk("Failed to resume secondary CPU core %d (MPID:%#llx)\n",
 			       cpu_num, cpu_mpid);
 			k_panic();
 		}
-		/* Wait secondary core up, then announce (mirrors the cold-boot path) */
-		while (arm64_cpu_boot_params.fn) {
-			wfe();
-		}
-		printk("Secondary CPU core %d (MPID:%#llx) is up\n", cpu_num, cpu_mpid);
-		return;
 	} else {
 		for (; i < cpu_count; i++) {
 			if (cpu_node_list[i] == primary_core_mpid) {
@@ -121,13 +124,7 @@ void arch_cpu_start(int cpu_num, k_thread_stack_t *stack, int sz,
 
 			cpu_mpid = cpu_node_list[i];
 
-			barrier_dsync_fence_full();
-
-			/* store mpid last as this is our synchronization point */
-			arm64_cpu_boot_params.mpid = cpu_mpid;
-
-			sys_cache_data_flush_range((void *)&arm64_cpu_boot_params,
-						   sizeof(arm64_cpu_boot_params));
+			publish_boot_mpid(cpu_mpid);
 
 			if (pm_cpu_on(cpu_mpid, (uint64_t)&__start)) {
 				printk("Failed to boot secondary CPU core %d (MPID:%#llx)\n",
@@ -146,15 +143,16 @@ void arch_cpu_start(int cpu_num, k_thread_stack_t *stack, int sz,
 			printk("Can't find CPU Core %d from dts and failed to boot it\n", cpu_num);
 			k_panic();
 		}
-
-		cpu_map[cpu_num] = cpu_mpid;
-		printk("Secondary CPU core %d (MPID:%#llx) is up\n", cpu_num, cpu_mpid);
 	}
 
 	/* Wait secondary core up, see arch_secondary_cpu_init */
 	while (arm64_cpu_boot_params.fn) {
 		wfe();
 	}
+
+	cpu_map[cpu_num] = cpu_mpid;
+
+	printk("Secondary CPU core %d (MPID:%#llx) is up\n", cpu_num, cpu_mpid);
 }
 
 /* the C entry of secondary cores */
@@ -170,7 +168,6 @@ FUNC_NORETURN void arch_secondary_cpu_init(void)
 	write_tpidrro_el0((uintptr_t)&_kernel.cpus[cpu_num]);
 
 	z_arm64_mm_init(false);
-	// printk("CPU%d: MMU init done\n", cpu_num);
 
 #ifdef CONFIG_ARM64_SAFE_EXCEPTION_STACK
 	z_arm64_safe_exception_stack_init();
@@ -178,7 +175,6 @@ FUNC_NORETURN void arch_secondary_cpu_init(void)
 
 #ifdef CONFIG_SMP
 	arm_gic_secondary_init();
-	// printk("CPU%d: GIC init done\n", cpu_num);
 
 	irq_enable(SGI_SCHED_IPI);
 #ifdef CONFIG_USERSPACE
@@ -194,8 +190,6 @@ FUNC_NORETURN void arch_secondary_cpu_init(void)
 	fn = arm64_cpu_boot_params.fn;
 	arg = arm64_cpu_boot_params.arg;
 	barrier_dsync_fence_full();
-
-	// printk("CPU%d: signalling ready, entering scheduler\n", cpu_num);
 
 	/*
 	 * Secondary core clears .fn to announce its presence.

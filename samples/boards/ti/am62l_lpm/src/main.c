@@ -1,25 +1,27 @@
-// SPDX-FileCopyrightText: Copyright The Zephyr Project Contributors
-// SPDX-License-Identifier: Apache-2.0
+/*
+ * SPDX-FileCopyrightText: Copyright The Zephyr Project Contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
 
 /*
  * AM62L S2RAM (suspend-to-RAM) demo.
  *
  * Each cycle:
- *   1. Read 3 bytes from the on-board AT24 EEPROM via I2C and store them in
- *      a DDR buffer (pre-suspend I2C check).  The EEPROM WP pin is hardwired
- *      HIGH on the AM62L EVM, so writes are not used.
- *   2. Arm the wakeup RTC alarm.
- *   3. Force PM_STATE_SUSPEND_TO_RAM.  The idle thread calls pm_state_set()
- *      -> arch_pm_s2ram_suspend() -> PSCI CPU_SUSPEND.  TF-A selects the
- *      system LPM mode based on its internal state.
- *      PM_DEVICE_SYSTEM_MANAGED issues TURN_OFF on all devices before entry.
- *   4. TF-A gates clocks, puts DDR into self-refresh and powers down the A53.
- *   5. RTC alarm fires.  TF-A resumes the A53 at arch_pm_s2ram_resume, which
- *      restores CPU context.  PM_DEVICE_SYSTEM_MANAGED issues TURN_ON on all
- *      devices, including the OMAP I2C controller (re-programs its hardware
- *      registers which were lost when the MAIN power domain was cut).
- *   6. Read back the EEPROM and verify the pattern matches the pre-suspend
- *      snapshot.  A mismatch or I2C error here means i2c_omap TURN_ON failed.
+ *   1. Arm the wakeup RTC alarm.
+ *   2. CPU0 signals CPU1 via semaphore (no pm_state_force() for CPU1: its
+ *      control thread calls pm_state_set() directly, so a forced slot would
+ *      go stale and make CPU1 power itself off again after resume).
+ *   3. CPU1's cpu1_pm_ctrl (highest-priority, CPU1-pinned) wakes and calls
+ *      pm_state_set(PM_STATE_SUSPEND_TO_RAM, 0) directly -> pm_cpu_off().
+ *   4. CPU0 polls am62l_wait_cpu1_off() (bounded, sleepable) to confirm
+ *      CPU1 reached PSCI AFF_STATE_OFF; skips this cycle on timeout.
+ *   5. CPU0 forces PM_STATE_SUSPEND_TO_RAM for itself and calls its own
+ *      pm_system_suspend() -> arch_pm_s2ram_suspend() -> PSCI SYSTEM_SUSPEND.
+ *   6. TF-A gates clocks, puts DDR into self-refresh and powers down the A53.
+ *   7. RTC alarm fires.  TF-A resumes the A53 at arch_pm_s2ram_resume.
+ *   8. PM_DEVICE_SYSTEM_MANAGED issues TURN_ON on all devices.
+ *   9. CPU0 calls k_smp_cpu_start(1, cpu1_pm_ctrl_restart, NULL) to recreate
+ *      cpu1_pm_ctrl for the next cycle.
  *
  * The 'cycles' counter lives in DDR and proves RAM retention across
  * self-refresh (it increments each cycle and is never reset by firmware).
@@ -32,6 +34,7 @@
 #include <zephyr/drivers/counter.h>
 #include <zephyr/sys_clock.h>
 #include <zephyr/logging/log.h>
+#include "power.h"
 
 LOG_MODULE_REGISTER(am62l_lpm, LOG_LEVEL_INF);
 
@@ -75,6 +78,52 @@ static int arm_rtc_alarm(void)
 	return ret;
 }
 
+/* CPU1 demo task: prints "I am alive" every 500ms, forever.
+ * Pinned to CPU1 via SYS_INIT(APPLICATION) so it's ready before CPU1 boots.
+ */
+K_THREAD_STACK_DEFINE(cpu1_task_stack, 4096);
+static struct k_thread cpu1_task_thread;
+
+static void cpu1_task(void *a, void *b, void *c)
+{
+	ARG_UNUSED(a);
+	ARG_UNUSED(b);
+	ARG_UNUSED(c);
+
+	while (1) {
+		printk("CPU1: I am alive\n");
+		k_sleep(K_SECONDS(1));
+	}
+}
+
+/* Create and pin both CPU1 threads at APPLICATION init level
+ * (before z_smp_init() boots CPU1). Both are cooperative; cpu1_pm_ctrl's
+ * higher priority means it is dispatched the next time cpu1_task yields
+ * (its k_sleep() call) after the semaphore is given - cooperative threads
+ * run to their own yield point regardless of what becomes ready meanwhile.
+ */
+static int cpu1_threads_init(void)
+{
+	/* cpu1_pm_ctrl: same creation power.c itself uses on every resume,
+	 * so stack size / priority can't drift out of sync between the two
+	 * call sites.
+	 */
+	cpu1_pm_ctrl_restart(NULL);
+
+	/* cpu1_task at normal priority */
+	k_thread_create(&cpu1_task_thread, cpu1_task_stack,
+			K_THREAD_STACK_SIZEOF(cpu1_task_stack),
+			cpu1_task, NULL, NULL, NULL,
+			K_PRIO_COOP(7), 0, K_FOREVER);
+	k_thread_cpu_mask_clear(&cpu1_task_thread);
+	k_thread_cpu_mask_enable(&cpu1_task_thread, 1);
+	k_thread_start(&cpu1_task_thread);
+
+	return 0;
+}
+
+SYS_INIT(cpu1_threads_init, APPLICATION, 0);
+
 int main(void)
 {
 	/*
@@ -105,10 +154,25 @@ int main(void)
 
 		LOG_INF("RTC alarm set for %u s, entering S2RAM...", WAKE_DELAY_S);
 
-		/* Step 3: CONFIG_LOG_MODE_IMMEDIATE ensures UART TX is idle here. */
+		/* Step 1: Kick CPU1 first so its shutdown proceeds while
+		 * CPU0 confirms it below.
+		 */
+		k_sem_give(&cpu1_pm_sem);
 
-		pm_state_force(0U,
-			&(struct pm_state_info){PM_STATE_SUSPEND_TO_RAM, 0, 0});
+		/* Step 2: Confirm CPU1 actually reached PSCI AFF_STATE_OFF
+		 * before risking PSCI_SYSTEM_SUSPEND - see power.c's
+		 * am62l_wait_cpu1_off() comment for why this can't be
+		 * skipped (TF-A's own internal poll can silently give up
+		 * and still report success).
+		 */
+		if (!am62l_wait_cpu1_off()) {
+			LOG_WRN("CPU1 did not shut down in time, skipping S2RAM this cycle");
+			k_msleep((WAKE_DELAY_S * 3U) * MSEC_PER_SEC);
+			continue;
+		}
+
+		/* Step 3: CPU0 enters S2RAM */
+		pm_state_force(0U, &s2ram_state);
 
 		LOG_INF("Going into S2RAM...");
 		/*

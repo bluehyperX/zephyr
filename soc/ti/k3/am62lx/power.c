@@ -1,5 +1,7 @@
-// SPDX-FileCopyrightText: Copyright The Zephyr Project Contributors
-// SPDX-License-Identifier: Apache-2.0
+/*
+ * SPDX-FileCopyrightText: Copyright The Zephyr Project Contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
 
 /*
  * AM62L SoC PM backend.
@@ -7,18 +9,36 @@
  * TF-A handles DDR self-refresh and LPM HAL entirely (via TIFS).  Zephyr
  * saves CPU context and drives PSCI CPU_SUSPEND.
  *
- * S2RAM with SMP (SGI + polled CPU_OFF):
- *   1. CPU0 sets s2ram_cpu1_req and raises SGI3 to CPU1.
- *   2. CPU1's SGI3 ISR sees s2ram_cpu1_req and calls pm_cpu_off().
- *      TF-A sets aff_info_state = AFF_STATE_OFF on CPU_OFF, so
- *      psci_affinity_info() works correctly here.
- *   3. CPU0 busy-polls psci_affinity_info() until CPU1 is off.
- *   4. CPU0 calls arch_pm_s2ram_suspend() -> psci_system_suspend().
- *   5. On resume CPU0 clears s2ram_cpu1_req and calls k_smp_cpu_start(1).
- *      k_smp_cpu_start runs full secondary init (GIC + timer), then the
- *      scheduler re-acquires CPU1.
+ * S2RAM with SMP (semaphore + control thread + affinity poll):
+ *   1. CPU0 calls pm_state_force(1, &s2ram_state) then k_sem_give(&cpu1_pm_sem).
+ *   2. CPU1's cpu1_pm_ctrl (highest-priority, CPU1-pinned thread) unblocks
+ *      and calls pm_state_set(PM_STATE_SUSPEND_TO_RAM, 0) directly ->
+ *      pm_cpu_off().  TF-A sets aff_info_state = AFF_STATE_OFF on CPU_OFF,
+ *      so psci_affinity_info() works correctly on resume.
+ *   3. CPU0 calls am62l_wait_cpu1_off() (see below) to confirm CPU1 is
+ *      really off, then pm_state_force(0, &s2ram_state) and its own
+ *      pm_system_suspend() -> arch_pm_s2ram_suspend() -> psci_system_suspend().
+ *   4. On resume CPU0 calls k_smp_cpu_start(1, cpu1_pm_ctrl_restart, NULL)
+ *      which recreates cpu1_pm_ctrl fresh on every resume cycle.
  *
- * Why SGI + k_smp_cpu_start (not k_smp_cpu_resume):
+ * Why CPU0 polls CPU1's affinity state (am62l_wait_cpu1_off()):
+ *   TF-A's own am62l_pwr_domain_suspend() (plat/ti/k3low/common/am62l_psci.c)
+ *   already polls CPU1's PSC MDSTAT register before CPU0's PSCI_SYSTEM_SUSPEND
+ *   proceeds, bounded at 10ms - but on timeout it just logs an error and
+ *   returns without ever calling the real suspend sequence, while the generic
+ *   PSCI framework (pwr_domain_suspend() is void) still reports SUCCESS back
+ *   to Zephyr.  A failed/skipped suspend would otherwise go undetected.
+ *   am62l_wait_cpu1_off() is a Zephyr-side, sleepable, bounded poll of
+ *   psci_affinity_info() mirroring Linux's cpu_psci_cpu_kill()
+ *   (arch/arm64/kernel/psci.c): same PSCI call, same AFFINITY_LEVEL_OFF
+ *   check, same style of bounded sleep-poll.  Unlike Linux (where this runs
+ *   *after* the primary in-kernel handoff and a timeout is just a warning
+ *   since the CPU is already presumed dead), here it runs *before* the risky
+ *   PSCI_SYSTEM_SUSPEND hand-off, so a timeout aborts/retries instead.
+ *   Must be called from a sleepable context (not from inside pm_state_set(),
+ *   which runs under k_sched_lock() where only busy-waiting is legal).
+ *
+ * Why k_smp_cpu_start (not k_smp_cpu_resume):
  *   PSCI CPU_OFF hardware-resets GICR_IGROUPR0 to 0 (Group 0 / FIQ).
  *   TF-A's pwr_domain_on_finish restores IGROUPR to 0xFFFF (Group 1) but
  *   does NOT restore GICR_IGRPMODR0.  k_smp_cpu_resume skips Zephyr's
@@ -26,16 +46,6 @@
  *   SGI3 is never taken (PSTATE.F=1 permanently).  k_smp_cpu_start runs
  *   arm_gic_secondary_init() which writes IGRPMODR=0xFFFF, making SGI3
  *   Group 1 NS (IRQ) and deliverable from cycle 2 onward.
- *
- * Why CPU0 guard in pm_state_set:
- *   Zephyr's PM framework calls pm_state_set on every idle CPU.  If CPU1's
- *   idle thread selects PM_STATE_SUSPEND_TO_RAM and enters this backend,
- *   it would issue PSCI for its own suspend, triggering TF-A's
- *   pwr_domain_suspend which calls k3_gic_cpuif_disable() -> ProcessorSleep=1.
- *   With ProcessorSleep=1 the redistributor stops forwarding interrupts, so
- *   CPU0's subsequent SGI3 is never presented to CPU1's CPU interface
- *   (GICR_ISPENDR0[3]=1 but ICC_HPPIR1_EL1=0x3FF).  The guard redirects
- *   secondary CPUs to WFI, keeping ProcessorSleep=0.
  */
 
 #include <zephyr/kernel.h>
@@ -49,105 +59,7 @@
 #include <zephyr/drivers/interrupt_controller/gic.h>
 #include <zephyr/kernel/smp.h>
 #include <zephyr/sys/sys_io.h>
-
-/* SGI3 is unallocated in smp.c (0=SCHED, 1=MMCFG, 2=FPU) */
-#define SGI_S2RAM_IPI           3
-
-/* CPU1 MPIDR: Aff0=1, all higher affinity levels 0 */
-#define CPU1_MPIDR              0x1ULL
-
-/*
- * ARM virtual timer PPI on GICv3.  Redistributor register offsets are
- * private to intc_gicv3.c; redefine the ones needed here for diagnostics.
- * gic_rdists[] is exported (non-static) by intc_gicv3.c but has no public
- * declaration, so it is externed directly.
- */
-#define VTIMER_INTID            27U
-#define GICR_SGI_BASE_OFF       0x10000UL
-#define GICR_IGROUPR0_OFF       0x0080UL
-#define GICR_ISACTIVER0_OFF     0x0300UL
-#define GICR_ICFGR0_OFF         0x0c00UL
-#define GICR_IGRPMODR0_OFF      0x0d00UL
-
-extern mem_addr_t gic_rdists[CONFIG_MP_MAX_NUM_CPUS];
-
-static void am62l_dump_vtimer_gic_state(const char *tag)
-{
-	mem_addr_t sgi_base = gic_rdists[arch_curr_cpu()->id] + GICR_SGI_BASE_OFF;
-	uint32_t igroupr = sys_read32(sgi_base + GICR_IGROUPR0_OFF);
-	uint32_t igrpmodr = sys_read32(sgi_base + GICR_IGRPMODR0_OFF);
-	uint32_t isactiver = sys_read32(sgi_base + GICR_ISACTIVER0_OFF);
-	uint32_t icfgr0 = sys_read32(sgi_base + GICR_ICFGR0_OFF);
-
-	printk("%s: vtimer(intid=%u) enabled=%d pending=%d "
-	       "group=%d grpmod=%d active=%d cfg=%d\n",
-	       tag, VTIMER_INTID,
-	       arm_gic_irq_is_enabled(VTIMER_INTID),
-	       arm_gic_irq_is_pending(VTIMER_INTID),
-	       (igroupr >> VTIMER_INTID) & 1U,
-	       (igrpmodr >> VTIMER_INTID) & 1U,
-	       (isactiver >> VTIMER_INTID) & 1U,
-	       (icfgr0 >> ((VTIMER_INTID % 16U) * 2U)) & 3U);
-}
-
-/*
- * PSCI AFFINITY_INFO raw return values (PSCI spec table 11).
- * psci_affinity_info() returns these directly (no psci_to_dev_err mapping).
- */
-#define PSCI_AFF_STATE_ON       0
-#define PSCI_AFF_STATE_OFF      1
-
-#ifdef CONFIG_SMP
-static atomic_t s2ram_cpu1_req;
-
-static void am62l_s2ram_cpu1_ipi(const void *arg)
-{
-	ARG_UNUSED(arg);
-	if (atomic_get(&s2ram_cpu1_req)) {
-		// printk("CPU1: SGI3 ISR: calling pm_cpu_off\n");
-		/*
-		 * pm_cpu_off()'s SMC never returns on success, so
-		 * isr_wrapper.S never reaches its post-ISR arm_gic_eoi()
-		 * call for this INTID.  SGI3 would stay latched Active at
-		 * the redistributor forever (GICv3: an Active interrupt
-		 * cannot be re-presented to the CPU interface until it is
-		 * deactivated), so the *next* cycle's SGI3 assertion would
-		 * only ever reach Pending and never be delivered.  Deactivate
-		 * it manually here, before the point of no return.
-		 */
-		arm_gic_eoi(SGI_S2RAM_IPI);
-		/*
-		 * Power CPU1 off entirely.  TF-A sets aff_info_state = OFF
-		 * on CPU_OFF, allowing CPU0 to use psci_affinity_info().
-		 * This SMC never returns on success.
-		 */
-		(void)pm_cpu_off();
-		/* Reached only on failure; disarm so CPU1 stays alive. */
-		atomic_set(&s2ram_cpu1_req, 0);
-	}
-}
-
-void soc_per_core_init_hook(void)
-{
-	if (arch_curr_cpu()->id == 0U) {
-		return;
-	}
-	/*
-	 * CPU1 only.  arm_gic_secondary_init() has already run, so the
-	 * redistributor is configured and IGRPMODR=0xFFFF (Group 1 NS).
-	 * Enable SGI3 so CPU0 can signal CPU1 to power itself off.
-	 */
-	// printk("CPU1: soc_per_core_init_hook: enabling SGI3\n");
-	irq_enable(SGI_S2RAM_IPI);
-}
-#endif /* CONFIG_SMP */
-
-static int am62l_system_off(void)
-{
-	uintptr_t resume_pa = (uintptr_t)arch_pm_s2ram_resume;
-
-	return psci_system_suspend(resume_pa);
-}
+#include "power.h"
 
 /*
  * ARM arch timer save/restore across S2RAM.
@@ -163,6 +75,89 @@ static int am62l_system_off(void)
 static uint64_t s2ram_cntv_cval;
 static uint64_t s2ram_cntv_ctl;
 
+/* Forced S2RAM state used by both CPUs */
+const struct pm_state_info s2ram_state = {
+	.state = PM_STATE_SUSPEND_TO_RAM,
+};
+
+#ifdef CONFIG_SMP
+/* MPIDR affinity value for CPU1 on this 2-core, single-cluster SoC. */
+#define CPU1_MPIDR			0x1ULL
+/* PSCI AFFINITY_INFO return value meaning "off" (PSCI spec, not in-tree elsewhere). */
+#define PSCI_AFFINITY_LEVEL_OFF		1
+#define CPU1_OFF_POLL_TIMEOUT_MS	100
+#define CPU1_OFF_POLL_INTERVAL_MS	1
+
+/* See "Why CPU0 polls CPU1's affinity state" above. */
+bool am62l_wait_cpu1_off(void)
+{
+	int64_t deadline = k_uptime_get() + CPU1_OFF_POLL_TIMEOUT_MS;
+
+	do {
+		if (psci_affinity_info(CPU1_MPIDR, 0) == PSCI_AFFINITY_LEVEL_OFF) {
+			return true;
+		}
+		k_msleep(CPU1_OFF_POLL_INTERVAL_MS);
+	} while (k_uptime_get() < deadline);
+
+	return false;
+}
+#endif /* CONFIG_SMP */
+
+/*
+ * True only across the window where s2ram_cntv_{cval,ctl} hold a value
+ * actually worth restoring, i.e. after CPU0 saved them and only until
+ * arch_pm_s2ram_suspend() reports whether the suspend really happened.
+ * If suspend fails, CPU0 never lost power and its live timer registers
+ * were never touched, so pm_state_exit_post_ops() must skip the restore.
+ */
+static bool s2ram_timer_saved;
+
+#ifdef CONFIG_SMP
+/* CPU1 control thread: woken by CPU0 via semaphore to initiate its own shutdown */
+K_THREAD_STACK_DEFINE(cpu1_pm_ctrl_stack, 4096);
+struct k_thread cpu1_pm_ctrl_thread;
+K_SEM_DEFINE(cpu1_pm_sem, 0, 1);
+
+void cpu1_pm_ctrl(void *a, void *b, void *c)
+{
+	ARG_UNUSED(a);
+	ARG_UNUSED(b);
+	ARG_UNUSED(c);
+
+	while (1) {
+		k_sem_take(&cpu1_pm_sem, K_FOREVER);
+		/* state passed explicitly below; no need to force a slot nothing reads. */
+		pm_state_set(PM_STATE_SUSPEND_TO_RAM, 0);
+		/* pm_cpu_off() failed (PSCI error): loop back and wait for retry. */
+	}
+}
+
+/*
+ * (Re)creates cpu1_pm_ctrl. Called via k_smp_cpu_start's fn on every CPU1
+ * resume, and directly by the sample's init code for the first boot - same
+ * k_thread_create() sequence either way, so it is not static.
+ */
+void cpu1_pm_ctrl_restart(void *arg)
+{
+	ARG_UNUSED(arg);
+	k_thread_create(&cpu1_pm_ctrl_thread, cpu1_pm_ctrl_stack,
+			K_THREAD_STACK_SIZEOF(cpu1_pm_ctrl_stack),
+			cpu1_pm_ctrl, NULL, NULL, NULL,
+			K_HIGHEST_APPLICATION_THREAD_PRIO, 0, K_FOREVER);
+	k_thread_cpu_mask_clear(&cpu1_pm_ctrl_thread);
+	k_thread_cpu_mask_enable(&cpu1_pm_ctrl_thread, 1);
+	k_thread_start(&cpu1_pm_ctrl_thread);
+}
+#endif /* CONFIG_SMP */
+
+static int am62l_system_off(void)
+{
+	uintptr_t resume_pa = (uintptr_t)arch_pm_s2ram_resume;
+
+	return psci_system_suspend(resume_pa);
+}
+
 void pm_state_set(enum pm_state state, uint8_t substate_id)
 {
 	ARG_UNUSED(substate_id);
@@ -170,33 +165,24 @@ void pm_state_set(enum pm_state state, uint8_t substate_id)
 	switch (state) {
 	case PM_STATE_SUSPEND_TO_RAM:
 #ifdef CONFIG_SMP
-		/*
-		 * Secondary CPUs must not independently drive S2RAM.  If the
-		 * PM policy selects S2RAM for CPU1, redirect it to WFI.  CPU1
-		 * will receive SGI3 from CPU0 (which does drive S2RAM) and
-		 * power itself off via the ISR.  Falling through to WFI keeps
-		 * ProcessorSleep=0 so the redistributor forwards the SGI.
-		 */
 		if (arch_curr_cpu()->id != 0U) {
-			k_cpu_idle();
+			/* CPU1: entered only via cpu1_pm_ctrl's direct pm_state_set()
+			 * call. Power this CPU off directly; never returns on success.
+			 */
+			(void)pm_cpu_off();
 			break;
 		}
 
 		/*
-		 * CPU0: signal CPU1 to power itself off via SGI3.
-		 * The ISR (am62l_s2ram_cpu1_ipi) checks s2ram_cpu1_req and
-		 * calls PSCI CPU_OFF.  TF-A updates aff_info_state = OFF so
-		 * psci_affinity_info() detects completion.
+		 * CPU0: by the time we reach this point the caller (app
+		 * code, a sleepable context) has already confirmed via
+		 * am62l_wait_cpu1_off() that CPU1 reached PSCI AFF_STATE_OFF.
+		 * That poll can't live here: pm_state_set() runs under
+		 * k_sched_lock(), where only busy-waiting is legal, and a
+		 * failed/timed-out wait needs to abort before any device
+		 * suspend or PSCI_SYSTEM_SUSPEND call happens, not from
+		 * inside this void, no-return-value function.
 		 */
-		// printk("CPU0: sending SGI3 to CPU1\n");
-		atomic_set(&s2ram_cpu1_req, 1);
-		gic_raise_sgi(SGI_S2RAM_IPI, CPU1_MPIDR, 1U << 1);
-
-		// printk("CPU0: polling affinity_info for CPU1\n");
-		while (psci_affinity_info(CPU1_MPIDR, 0) == PSCI_AFF_STATE_ON) {
-			k_busy_wait(100);
-		}
-		// printk("CPU0: CPU1 is off\n");
 #endif
 		/*
 		 * Save CPU0 context and call PSCI_SYSTEM_SUSPEND.
@@ -204,15 +190,20 @@ void pm_state_set(enum pm_state state, uint8_t substate_id)
 		 */
 		s2ram_cntv_cval = read_sysreg(cntv_cval_el0);
 		s2ram_cntv_ctl  = read_sysreg(cntv_ctl_el0);
-		/* TEMP DIAG */
-		printk("pm_state_set: pre-suspend cval=0x%llx ctl=0x%llx cntvct=0x%llx\n",
-		       s2ram_cntv_cval, s2ram_cntv_ctl, read_sysreg(cntvct_el0));
-		am62l_dump_vtimer_gic_state("pre-suspend");
-		arch_pm_s2ram_suspend(am62l_system_off);
-		/* TEMP DIAG */
-		printk("pm_state_set: resumed from S2RAM, cntvct=0x%llx\n",
-		       read_sysreg(cntvct_el0));
-		am62l_dump_vtimer_gic_state("post-resume");
+		/*
+		 * A non-zero return means CPU0 never actually suspended (e.g.
+		 * psci_system_suspend() rejected it) and is still fully
+		 * operational with its timer untouched - nothing to restore.
+		 */
+		printk("DBG: isr_el1=%#llx cntv_ctl=%#llx cval-cnt=%lld daif=%#llx\n", /* DBG */
+		       (unsigned long long)read_sysreg(isr_el1), /* DBG */
+		       (unsigned long long)s2ram_cntv_ctl, /* DBG */
+		       (long long)(s2ram_cntv_cval - read_sysreg(cntvct_el0)), /* DBG */
+		       (unsigned long long)read_sysreg(daif)); /* DBG */
+		int sus_ret = arch_pm_s2ram_suspend(am62l_system_off); /* DBG */
+
+		printk("DBG: arch_pm_s2ram_suspend returned %d\n", sus_ret); /* DBG */
+		s2ram_timer_saved = (sus_ret == 0);
 #ifdef CONFIG_SMP
 		/*
 		 * CPU1 was powered off via PSCI CPU_OFF before suspend.
@@ -220,11 +211,10 @@ void pm_state_set(enum pm_state state, uint8_t substate_id)
 		 * it runs arm_gic_secondary_init() which writes IGRPMODR=0xFFFF,
 		 * restoring SGI3 to Group 1 NS after the power-domain reset
 		 * that left IGROUPR=0 (Group 0 / FIQ) on the redistributor.
+		 * Pass cpu1_pm_ctrl_restart to recreate the control thread
+		 * on every resume cycle.
 		 */
-		atomic_set(&s2ram_cpu1_req, 0);
-		// printk("CPU0: starting CPU1 via k_smp_cpu_start\n");
-		k_smp_cpu_start(1, NULL, NULL);
-		// printk("CPU0: k_smp_cpu_start done\n");
+		k_smp_cpu_start(1, cpu1_pm_ctrl_restart, NULL);
 #endif
 		break;
 
@@ -242,9 +232,6 @@ void pm_state_exit_post_ops(enum pm_state state, uint8_t substate_id)
 {
 	ARG_UNUSED(substate_id);
 
-	/* TEMP DIAG */
-	// printk("post_ops: enter state=%d cpu=%u\n", state, arch_curr_cpu()->id);
-
 	/*
 	 * Only CPU0 actually drives S2RAM and saves/restores the timer
 	 * (see pm_state_set).  The PM framework still calls this hook on
@@ -254,7 +241,7 @@ void pm_state_exit_post_ops(enum pm_state state, uint8_t substate_id)
 	 * CNTV_CTL_EL0/CNTV_CVAL_EL0 with CPU0's stale (zero-initialized)
 	 * saved values, disabling CPU1's tick from the first guard cycle on.
 	 */
-	if (state == PM_STATE_SUSPEND_TO_RAM && arch_curr_cpu()->id == 0U) {
+	if (state == PM_STATE_SUSPEND_TO_RAM && arch_curr_cpu()->id == 0U && s2ram_timer_saved) {
 		/*
 		 * Restore the ARM arch timer registers saved before suspend.
 		 * CVAL is written before CTL so the compare value is in place
@@ -275,33 +262,7 @@ void pm_state_exit_post_ops(enum pm_state state, uint8_t substate_id)
 		 */
 		write_sysreg(s2ram_cntv_cval, cntv_cval_el0);
 		write_sysreg(s2ram_cntv_ctl & ~2ULL, cntv_ctl_el0);
-
-		/* TEMP DIAG */
-		printk("post_ops: saved_ctl=0x%llx saved_cval=0x%llx "
-		       "readback_ctl=0x%llx readback_cval=0x%llx cntvct=0x%llx "
-		       "(cval-cntvct=%lld)\n",
-		       s2ram_cntv_ctl, s2ram_cntv_cval,
-		       read_sysreg(cntv_ctl_el0), read_sysreg(cntv_cval_el0),
-		       read_sysreg(cntvct_el0),
-		       (int64_t)(read_sysreg(cntv_cval_el0) - read_sysreg(cntvct_el0)));
-		am62l_dump_vtimer_gic_state("post_ops-pre-unlock");
 	}
 
-	/* TEMP DIAG */
-	// printk("post_ops: about to irq_unlock, cpu=%u\n", arch_curr_cpu()->id);
 	irq_unlock(0);
-	// printk("post_ops: irq_unlock done, cpu=%u\n", arch_curr_cpu()->id);
-	if (state == PM_STATE_SUSPEND_TO_RAM && arch_curr_cpu()->id == 0U) {
-		am62l_dump_vtimer_gic_state("post_ops-post-unlock");
-	}
 }
-
-#ifdef CONFIG_SMP
-static int am62l_pm_init(void)
-{
-	IRQ_CONNECT(SGI_S2RAM_IPI, IRQ_DEFAULT_PRIORITY,
-		    am62l_s2ram_cpu1_ipi, NULL, 0);
-	return 0;
-}
-SYS_INIT(am62l_pm_init, PRE_KERNEL_2, 0);
-#endif /* CONFIG_SMP */
