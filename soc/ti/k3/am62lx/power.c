@@ -28,24 +28,29 @@
  *   returns without ever calling the real suspend sequence, while the generic
  *   PSCI framework (pwr_domain_suspend() is void) still reports SUCCESS back
  *   to Zephyr.  A failed/skipped suspend would otherwise go undetected.
- *   am62l_wait_cpu1_off() is a Zephyr-side, sleepable, bounded poll of
+ *   am62l_wait_cpu1_off() is a Zephyr-side, bounded busy-wait poll of
  *   psci_affinity_info() mirroring Linux's cpu_psci_cpu_kill()
  *   (arch/arm64/kernel/psci.c): same PSCI call, same AFFINITY_LEVEL_OFF
- *   check, same style of bounded sleep-poll.  Unlike Linux (where this runs
+ *   check, bounded poll (busy-wait, see below).  Unlike Linux (where this runs
  *   *after* the primary in-kernel handoff and a timeout is just a warning
  *   since the CPU is already presumed dead), here it runs *before* the risky
  *   PSCI_SYSTEM_SUSPEND hand-off, so a timeout aborts/retries instead.
- *   Must be called from a sleepable context (not from inside pm_state_set(),
- *   which runs under k_sched_lock() where only busy-waiting is legal).
+ *   It busy-waits rather than sleeps: on hardware, sleeping in this
+ *   window (k_msleep) left the A53 unable to power down in TIFS (~50 mW
+ *   instead of ~15 mW).  Call it from thread context before forcing CPU0's
+ *   state, not from inside pm_state_set().
  *
- * Why k_smp_cpu_start (not k_smp_cpu_resume):
- *   PSCI CPU_OFF hardware-resets GICR_IGROUPR0 to 0 (Group 0 / FIQ).
- *   TF-A's pwr_domain_on_finish restores IGROUPR to 0xFFFF (Group 1) but
- *   does NOT restore GICR_IGRPMODR0.  k_smp_cpu_resume skips Zephyr's
- *   secondary GIC init, so IGRPMODR remains 0 (Group 1 Secure / FIQ) and
- *   SGI3 is never taken (PSTATE.F=1 permanently).  k_smp_cpu_start runs
- *   arm_gic_secondary_init() which writes IGRPMODR=0xFFFF, making SGI3
- *   Group 1 NS (IRQ) and deliverable from cycle 2 onward.
+ * Why CPU1 is restarted with k_smp_cpu_start (not k_smp_cpu_resume):
+ *   This applies to CPU1 only, which is powered off with PSCI CPU_OFF.
+ *   CPU_OFF hardware-resets its GIC redistributor registers, leaving
+ *   GICR_IGROUPR0 = 0 (Group 0 / FIQ).  TF-A's pwr_domain_on_finish
+ *   restores IGROUPR to 0xFFFF (Group 1) but not GICR_IGRPMODR0, so
+ *   SGI3 would stay Group 1 Secure (FIQ) and never be taken with
+ *   PSTATE.F=1.  k_smp_cpu_resume skips Zephyr's secondary GIC init;
+ *   k_smp_cpu_start runs arm_gic_secondary_init(), which writes
+ *   IGRPMODR=0xFFFF and makes SGI3 Group 1 NS (IRQ) again.
+ *   CPU0 does not need this: TF-A saves and restores its whole GIC
+ *   (including IGROUPR/IGRPMODR) around PSCI_SYSTEM_SUSPEND.
  */
 
 #include <zephyr/kernel.h>
@@ -61,19 +66,12 @@
 #include <zephyr/sys/sys_io.h>
 #include "power.h"
 
-/*
- * ARM arch timer save/restore across S2RAM.
- *
- * arch_pm_s2ram_suspend/resume saves MMU, VBAR, and callee-saved GPRs but
- * not the ARM arch timer registers.  The MAIN power domain cut resets
- * CNTV_CTL_EL0 to 0x2 (ENABLE=0, IMASK=1) and CNTV_CVAL_EL0 to an
- * unknown value, preventing tick interrupts after resume.
- *
- * Zephyr's arm64 timer driver uses the virtual timer (CNTV), not the
- * physical timer (CNTP).
- */
-static uint64_t s2ram_cntv_cval;
-static uint64_t s2ram_cntv_ctl;
+#if defined(CONFIG_SMP) && defined(CONFIG_FPU_SHARING)
+/* arch-internal; no public equivalent */
+extern void arch_flush_local_fpu(void);
+#else
+#define arch_flush_local_fpu() do { } while (0)
+#endif
 
 /* Forced S2RAM state used by both CPUs */
 const struct pm_state_info s2ram_state = {
@@ -97,21 +95,16 @@ bool am62l_wait_cpu1_off(void)
 		if (psci_affinity_info(CPU1_MPIDR, 0) == PSCI_AFFINITY_LEVEL_OFF) {
 			return true;
 		}
-		k_msleep(CPU1_OFF_POLL_INTERVAL_MS);
+		/* Busy-wait, not k_msleep(): sleeping lets CPU0 take timer/scheduler
+		 * IPI activity that leaves the A53 unable to power down in TIFS
+		 * (suspend stalls at ~50 mW instead of ~15 mW).
+		 */
+		k_busy_wait(CPU1_OFF_POLL_INTERVAL_MS * USEC_PER_MSEC);
 	} while (k_uptime_get() < deadline);
 
 	return false;
 }
 #endif /* CONFIG_SMP */
-
-/*
- * True only across the window where s2ram_cntv_{cval,ctl} hold a value
- * actually worth restoring, i.e. after CPU0 saved them and only until
- * arch_pm_s2ram_suspend() reports whether the suspend really happened.
- * If suspend fails, CPU0 never lost power and its live timer registers
- * were never touched, so pm_state_exit_post_ops() must skip the restore.
- */
-static bool s2ram_timer_saved;
 
 #ifdef CONFIG_SMP
 /* CPU1 control thread: woken by CPU0 via semaphore to initiate its own shutdown */
@@ -169,7 +162,22 @@ void pm_state_set(enum pm_state state, uint8_t substate_id)
 			/* CPU1: entered only via cpu1_pm_ctrl's direct pm_state_set()
 			 * call. Power this CPU off directly; never returns on success.
 			 */
+			/*
+			 * Release any live FPU context on this CPU first.  With
+			 * FPU_SHARING a thread (e.g. main) may own CPU1's FPU;
+			 * if CPU1 goes off still owning it, CPU0 would spin
+			 * forever in flush_owned_fpu() waiting for an IPI ack.
+			 *
+			 * Use the per-CPU arch_irq_lock(), not irq_lock(): on SMP
+			 * irq_lock() takes the system-wide global lock, and
+			 * pm_cpu_off() never returns, so CPU1 would die holding it
+			 * and CPU0's next irq_lock() would spin forever.
+			 */
+			unsigned int key = arch_irq_lock();
+
+			arch_flush_local_fpu();
 			(void)pm_cpu_off();
+			arch_irq_unlock(key);
 			break;
 		}
 
@@ -188,31 +196,27 @@ void pm_state_set(enum pm_state state, uint8_t substate_id)
 		 * Save CPU0 context and call PSCI_SYSTEM_SUSPEND.
 		 * Returns here after full resume and TURN_ON for all devices.
 		 */
-		s2ram_cntv_cval = read_sysreg(cntv_cval_el0);
-		s2ram_cntv_ctl  = read_sysreg(cntv_ctl_el0);
+		/*
+		 * The FP/SIMD register file loses power with the A53 and is
+		 * not saved by arch_pm_s2ram_suspend().  Spill any live FPU
+		 * context into its thread now (IRQs are already masked here)
+		 * so the lazy-FPU trap reloads it after resume.
+		 */
+		arch_flush_local_fpu();
 		/*
 		 * A non-zero return means CPU0 never actually suspended (e.g.
-		 * psci_system_suspend() rejected it) and is still fully
-		 * operational with its timer untouched - nothing to restore.
+		 * psci_system_suspend() rejected it) and is still operational.
+		 * The ARM arch timer is stopped/re-armed by its driver via a
+		 * PM notifier (drivers/timer/arm_arch_timer.c).
 		 */
-		printk("DBG: isr_el1=%#llx cntv_ctl=%#llx cval-cnt=%lld daif=%#llx\n", /* DBG */
-		       (unsigned long long)read_sysreg(isr_el1), /* DBG */
-		       (unsigned long long)s2ram_cntv_ctl, /* DBG */
-		       (long long)(s2ram_cntv_cval - read_sysreg(cntvct_el0)), /* DBG */
-		       (unsigned long long)read_sysreg(daif)); /* DBG */
-		int sus_ret = arch_pm_s2ram_suspend(am62l_system_off); /* DBG */
-
-		printk("DBG: arch_pm_s2ram_suspend returned %d\n", sus_ret); /* DBG */
-		s2ram_timer_saved = (sus_ret == 0);
+		(void)arch_pm_s2ram_suspend(am62l_system_off);
 #ifdef CONFIG_SMP
 		/*
-		 * CPU1 was powered off via PSCI CPU_OFF before suspend.
-		 * k_smp_cpu_start (not k_smp_cpu_resume) is required here:
-		 * it runs arm_gic_secondary_init() which writes IGRPMODR=0xFFFF,
-		 * restoring SGI3 to Group 1 NS after the power-domain reset
-		 * that left IGROUPR=0 (Group 0 / FIQ) on the redistributor.
-		 * Pass cpu1_pm_ctrl_restart to recreate the control thread
-		 * on every resume cycle.
+		 * CPU1 was powered off via PSCI CPU_OFF before suspend, so it
+		 * needs a full restart (see "Why CPU1 is restarted with
+		 * k_smp_cpu_start" at the top of this file).  Passing
+		 * cpu1_pm_ctrl_restart recreates the control thread on every
+		 * resume cycle.
 		 */
 		k_smp_cpu_start(1, cpu1_pm_ctrl_restart, NULL);
 #endif
@@ -230,39 +234,8 @@ void pm_state_set(enum pm_state state, uint8_t substate_id)
 
 void pm_state_exit_post_ops(enum pm_state state, uint8_t substate_id)
 {
+	ARG_UNUSED(state);
 	ARG_UNUSED(substate_id);
-
-	/*
-	 * Only CPU0 actually drives S2RAM and saves/restores the timer
-	 * (see pm_state_set).  The PM framework still calls this hook on
-	 * CPU1 with state == PM_STATE_SUSPEND_TO_RAM (its pending exit
-	 * state was latched before the guard redirected it to k_cpu_idle()),
-	 * so without this CPU0 check CPU1 would overwrite its own live
-	 * CNTV_CTL_EL0/CNTV_CVAL_EL0 with CPU0's stale (zero-initialized)
-	 * saved values, disabling CPU1's tick from the first guard cycle on.
-	 */
-	if (state == PM_STATE_SUSPEND_TO_RAM && arch_curr_cpu()->id == 0U && s2ram_timer_saved) {
-		/*
-		 * Restore the ARM arch timer registers saved before suspend.
-		 * CVAL is written before CTL so the compare value is in place
-		 * before the timer is re-enabled.
-		 *
-		 * Force IMASK=0 (bit 1) regardless of the saved value.  In
-		 * tickless mode the timer ISR sets IMASK=1 before announcing
-		 * ticks; sys_clock_set_timeout() clears it when programming the
-		 * next event.  If the save in pm_state_set() captured CNTV_CTL
-		 * between ISR (IMASK=1) and sys_clock_set_timeout() (IMASK=0),
-		 * the saved value has IMASK=1.  Restoring that value faithfully
-		 * would leave the timer permanently masked after resume, causing
-		 * k_msleep() and all timeout-dependent code to hang forever.
-		 * Stripping IMASK here is always safe: CVAL is in the past after
-		 * a multi-second suspend, so the ISR fires immediately once IRQs
-		 * are unmasked by irq_unlock() below and sys_clock_announce()
-		 * unblocks any pending timeouts.
-		 */
-		write_sysreg(s2ram_cntv_cval, cntv_cval_el0);
-		write_sysreg(s2ram_cntv_ctl & ~2ULL, cntv_ctl_el0);
-	}
 
 	irq_unlock(0);
 }

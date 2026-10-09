@@ -9,6 +9,9 @@
 #include <zephyr/irq.h>
 #include <zephyr/sys_clock.h>
 #include <zephyr/arch/cpu.h>
+#ifdef CONFIG_PM_S2RAM
+#include <zephyr/pm/pm.h>
+#endif
 
 #ifdef CONFIG_TIMER_READS_ITS_FREQUENCY_AT_RUNTIME
 /* precompute CYC_PER_TICK at driver init to avoid runtime double divisions */
@@ -188,18 +191,58 @@ void arch_busy_wait(uint32_t usec_to_wait)
 }
 #endif
 
+/* Arm the timer to fire one tick after the last announced tick. */
+static void arm_arch_timer_start(void)
+{
+	arm_arch_timer_set_compare(last_cycle + CYC_PER_TICK);
+	arm_arch_timer_enable(true);
+	irq_enable(ARM_ARCH_TIMER_IRQ);
+	arm_arch_timer_set_irq_mask(false);
+}
+
 #ifdef CONFIG_SMP
 void smp_timer_init(void)
 {
 	/*
 	 * set the initial status of timer0 of each secondary core
 	 */
-	arm_arch_timer_set_compare(last_cycle + CYC_PER_TICK);
-	arm_arch_timer_enable(true);
-	irq_enable(ARM_ARCH_TIMER_IRQ);
-	arm_arch_timer_set_irq_mask(false);
+	arm_arch_timer_start();
 }
 #endif
+
+#ifdef CONFIG_PM_S2RAM
+/*
+ * Suspend-to-RAM powers the CPU (and its generic timer registers) down.
+ *
+ * On entry, stop the timer so it cannot expire, and leave a pending
+ * interrupt, while firmware powers the core down (a pending interrupt makes
+ * firmware abort the suspend).
+ *
+ * On exit, re-arm it. last_cycle/last_tick live in retained RAM and the
+ * system counter keeps running, so the compare value is already in the past:
+ * the ISR fires at once, announces the ticks that elapsed during suspend and
+ * the kernel then programs the next timeout. This also covers an aborted
+ * suspend, where the timer was merely stopped.
+ */
+static void arm_arch_timer_pm_entry(enum pm_state state)
+{
+	if (state == PM_STATE_SUSPEND_TO_RAM) {
+		arm_arch_timer_enable(false);
+	}
+}
+
+static void arm_arch_timer_pm_exit(enum pm_state state)
+{
+	if (state == PM_STATE_SUSPEND_TO_RAM) {
+		arm_arch_timer_start();
+	}
+}
+
+static struct pm_notifier arm_arch_timer_pm_notifier = {
+	.state_entry = arm_arch_timer_pm_entry,
+	.state_exit = arm_arch_timer_pm_exit,
+};
+#endif /* CONFIG_PM_S2RAM */
 
 static int sys_clock_driver_init(void)
 {
@@ -212,10 +255,10 @@ static int sys_clock_driver_init(void)
 #endif
 	last_tick = arm_arch_timer_count() / CYC_PER_TICK;
 	last_cycle = last_tick * CYC_PER_TICK;
-	arm_arch_timer_set_compare(last_cycle + CYC_PER_TICK);
-	arm_arch_timer_enable(true);
-	irq_enable(ARM_ARCH_TIMER_IRQ);
-	arm_arch_timer_set_irq_mask(false);
+	arm_arch_timer_start();
+#ifdef CONFIG_PM_S2RAM
+	pm_notifier_register(&arm_arch_timer_pm_notifier);
+#endif
 
 	return 0;
 }

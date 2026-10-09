@@ -78,7 +78,7 @@ static int arm_rtc_alarm(void)
 	return ret;
 }
 
-/* CPU1 demo task: prints "I am alive" every 500ms, forever.
+/* CPU1 demo task: prints "I am alive" every 1s (busy-wait), forever.
  * Pinned to CPU1 via SYS_INIT(APPLICATION) so it's ready before CPU1 boots.
  */
 K_THREAD_STACK_DEFINE(cpu1_task_stack, 4096);
@@ -90,17 +90,24 @@ static void cpu1_task(void *a, void *b, void *c)
 	ARG_UNUSED(b);
 	ARG_UNUSED(c);
 
+	/*
+	 * Never sleeps: CPU1 is genuinely busy when CPU0 triggers S2RAM, so the
+	 * counter (a stack local, saved by the preemption that precedes CPU_OFF
+	 * and kept in retained DDR) continuing without a gap after resume shows
+	 * the running task was saved and restored.
+	 */
+	uint32_t n = 0;
+
 	while (1) {
-		printk("CPU1: I am alive\n");
-		k_sleep(K_SECONDS(1));
+		printk("\r\nCPU1: I am alive (%u)\r\n", n++);
+		k_busy_wait(USEC_PER_SEC);
 	}
 }
 
 /* Create and pin both CPU1 threads at APPLICATION init level
- * (before z_smp_init() boots CPU1). Both are cooperative; cpu1_pm_ctrl's
- * higher priority means it is dispatched the next time cpu1_task yields
- * (its k_sleep() call) after the semaphore is given - cooperative threads
- * run to their own yield point regardless of what becomes ready meanwhile.
+ * (before z_smp_init() boots CPU1). cpu1_pm_ctrl is cooperative and
+ * cpu1_task is preemptible, so giving the semaphore preempts the busy
+ * cpu1_task immediately (via the scheduler IPI).
  */
 static int cpu1_threads_init(void)
 {
@@ -114,7 +121,7 @@ static int cpu1_threads_init(void)
 	k_thread_create(&cpu1_task_thread, cpu1_task_stack,
 			K_THREAD_STACK_SIZEOF(cpu1_task_stack),
 			cpu1_task, NULL, NULL, NULL,
-			K_PRIO_COOP(7), 0, K_FOREVER);
+			K_PRIO_PREEMPT(0), 0, K_FOREVER);
 	k_thread_cpu_mask_clear(&cpu1_task_thread);
 	k_thread_cpu_mask_enable(&cpu1_task_thread, 1);
 	k_thread_start(&cpu1_task_thread);
@@ -140,7 +147,7 @@ int main(void)
 
 	if (!device_is_ready(rtc_dev)) {
 		LOG_ERR("RTC not ready");
-		return -ENODEV;
+		return 0;
 	}
 
 	for (;;) {
@@ -180,8 +187,16 @@ int main(void)
 		 * pm_state_set(S2RAM).  Returns here after full resume and
 		 * PM_DEVICE_ACTION_TURN_ON has been issued to all devices.
 		 */
-		k_msleep((WAKE_DELAY_S * 3U) * MSEC_PER_SEC);
+		// k_msleep((WAKE_DELAY_S) * MSEC_PER_SEC);
+		k_sleep(K_SECONDS(1));
 		LOG_INF("Resumed from S2RAM (DDR-retained counter: %u)", cycles);
+
+		/* TEMP DEBUG: halt here, dump regs ("after"), then set
+		 * dbg_hold_post = 0 from the debugger to continue.
+		 */
+		// volatile int dbg_hold_post = 1;
+		// while (dbg_hold_post) {
+		// }
 	}
 
 	return 0;

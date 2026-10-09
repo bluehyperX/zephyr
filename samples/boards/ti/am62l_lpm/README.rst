@@ -12,7 +12,7 @@ both A53 cores participating: CPU1 runs an independent demo task and is
 powered off via PSCI CPU_OFF before CPU0 forces its own PSCI
 SYSTEM_SUSPEND.
 
-CPU1 runs ``cpu1_task``, which just prints "I am alive" every 500 ms, and
+CPU1 runs ``cpu1_task``, which just prints "I am alive" every 1 s, and
 is pinned to CPU1 at boot via :c:func:`k_thread_cpu_mask_enable`. A second
 CPU1-pinned, highest-priority thread (``cpu1_pm_ctrl``, in
 :zephyr_file:`soc/ti/k3/am62lx/power.c`) blocks on a semaphore and, when

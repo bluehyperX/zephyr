@@ -34,35 +34,61 @@ SECTION_FUNC(text, arch_pm_s2ram_suspend)
 	/* Preserve system_off fn pointer across bl calls */
 	mov	x19, x0
 
-	/* Save all sysregs to _cpu_context */
+	/*
+	 * Save the EL1/EL0 system registers that TF-A leaves at their
+	 * hardware reset values after a suspend and that Zephyr relies on.
+	 * Each one is saved here and restored in arch_pm_s2ram_resume.
+	 *
+	 * Not saved on purpose:
+	 *  - FP/SIMD registers V0-V31, FPCR, FPSR: the caller flushes the
+	 *    live FPU context into the owning thread before suspending
+	 *    (arch_flush_local_fpu), so the lazy-FPU trap reloads it later.
+	 *  - GIC CPU interface and EL2 registers: rebuilt from constants on
+	 *    resume (Zephyr never changes them after boot).
+	 *  - Generic timer: stopped/re-armed by the arm arch timer driver
+	 *    through a PM notifier (drivers/timer/arm_arch_timer.c).
+	 */
 	adrp	x0, _cpu_context
 	add	x0, x0, :lo12:_cpu_context
+
+	/* SP: the resume path needs a valid stack before anything else. */
 	mov	x1, sp
 	str	x1, [x0, #0]		/* _cpu_context.sp */
+
+	/* VBAR_EL1: exception vector base; needed for any fault/IRQ. */
 	mrs	x1, vbar_el1
 	str	x1, [x0, #8]		/* _cpu_context.vbar_el1 */
+
+	/* MAIR_EL1, TCR_EL1, TTBR0_EL1: memory attributes and page tables. */
 	mrs	x1, mair_el1
 	str	x1, [x0, #16]		/* _cpu_context.mair_el1 */
 	mrs	x1, tcr_el1
 	str	x1, [x0, #24]		/* _cpu_context.tcr_el1 */
 	mrs	x1, ttbr0_el1
 	str	x1, [x0, #32]		/* _cpu_context.ttbr0_el1 */
+
+	/* SCTLR_EL1: MMU/caches enable; written last to turn the MMU on. */
 	mrs	x1, sctlr_el1
 	str	x1, [x0, #40]		/* _cpu_context.sctlr_el1 */
+
+	/* CPACR_EL1: FP/SIMD access control (lazy FPU state of the CPU). */
 	mrs	x1, cpacr_el1
 	str	x1, [x0, #48]		/* _cpu_context.cpacr_el1 */
+
+	/* TPIDRRO_EL0: Zephyr keeps the current CPU struct pointer here;
+	 * the exception entry code reads it. */
 	mrs	x1, tpidrro_el0
 	str	x1, [x0, #56]		/* _cpu_context.tpidrro_el0 */
-	mrs	x1, mdscr_el1
-	str	x1, [x0, #64]		/* _cpu_context.mdscr_el1 */
+
+	/* TPIDR_EL0: per-thread pointer (TLS/ARCH_HAS_THREAD_LOCAL_STORAGE),
+	 * reloaded at every context switch, so the current thread needs it. */
 	mrs	x1, tpidr_el0
-	str	x1, [x0, #72]		/* _cpu_context.tpidr_el0 */
-	mrs	x1, contextidr_el1
-	str	x1, [x0, #80]		/* _cpu_context.contextidr_el1 */
+	str	x1, [x0, #64]		/* _cpu_context.tpidr_el0 */
+
+	/* SP_EL0: Zephyr uses it as the thread stack pointer while running
+	 * at EL1h (see switch.S, vector_table.S). */
 	mrs	x1, sp_el0
-	str	x1, [x0, #88]		/* _cpu_context.sp_el0 */
-	mrs	x1, osdlr_el1
-	str	x1, [x0, #96]		/* _cpu_context.osdlr_el1 */
+	str	x1, [x0, #72]		/* _cpu_context.sp_el0 */
 
 	dsb	sy
 
@@ -97,7 +123,7 @@ SECTION_FUNC(text, arch_pm_s2ram_suspend)
  * not go through the Linux S2Idle flow that sets that variable).  The CPU
  * arrives here with all EL1/EL2 sysregs at hardware reset values:
  *   SCTLR_EL1.M=0 (MMU off), MAIR_EL1=0, TCR_EL1=0, TTBR0_EL1=0
- *   tpidrro_el0=0, tpidr_el0=0, cpacr_el1=0, mdscr_el1=0, ...
+ *   tpidrro_el0=0, tpidr_el0=0, cpacr_el1=0, ...
  *   HCR_EL2=0x2 (RW=0 — EL1 AArch32), CPTR_EL2=0x33FF (TFP=1)
  *
  * Restore order:
@@ -223,7 +249,9 @@ SECTION_FUNC(text, arch_pm_s2ram_resume)
 	bl	pm_s2ram_mark_check_and_clear
 	cbz	x0, .L_no_magic
 
-	/* Pop callee-saved GPRs (DDR retained in self-refresh) */
+	/* Pop callee-saved GPRs x19-x30 (AAPCS64 callee-saved set, includes
+	 * FP x29 and LR x30) from the DDR-retained stack. Caller-saved
+	 * registers are dead across the call, so they need no restore. */
 	ldp	x29, x30, [sp], #16
 	ldp	x27, x28, [sp], #16
 	ldp	x25, x26, [sp], #16
@@ -248,25 +276,19 @@ SECTION_FUNC(text, arch_pm_s2ram_resume)
 
 	/* CPACR_EL1: force FPEN=0b11 so the first FP instruction after ERET
 	 * does not trap even if the saved value had FPEN=0 (lazy FP disabled).
-	 * The lazy-FP path will re-disable FPEN on the next context switch. */
+	 * The lazy-FP path will re-disable FPEN on the next context switch.
+	 * Note: the FP register file itself is NOT restored here; callers
+	 * must flush FPU ownership before suspend (arch_flush_local_fpu). */
 	ldr	x2, [x1, #48]
 	orr	x2, x2, #(3 << 20)	/* force FPEN=0b11: EL1/EL0 FP not trapped */
 	msr	cpacr_el1, x2
 
 	ldr	x2, [x1, #64]
-	msr	mdscr_el1, x2		/* debug state control */
-
-	ldr	x2, [x1, #72]
 	msr	tpidr_el0, x2		/* EL0 thread pointer */
 
-	ldr	x2, [x1, #80]
-	msr	contextidr_el1, x2	/* ASID context */
-
-	ldr	x2, [x1, #88]
+	ldr	x2, [x1, #72]
 	msr	sp_el0, x2		/* EL0 stack pointer */
 
-	ldr	x2, [x1, #96]
-	msr	osdlr_el1, x2		/* OS Double Lock */
 	isb
 
 	/*

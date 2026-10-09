@@ -288,11 +288,8 @@ struct __cpu_context {
 	uint64_t sctlr_el1;      /* offset 40 — restore last to re-enable MMU */
 	uint64_t cpacr_el1;      /* offset 48 — FP/SIMD access; TF-A resets to 0 */
 	uint64_t tpidrro_el0;    /* offset 56 — CPU struct pointer; TF-A resets to 0 */
-	uint64_t mdscr_el1;      /* offset 64 — debug state control */
-	uint64_t tpidr_el0;      /* offset 72 — EL0 thread pointer */
-	uint64_t contextidr_el1; /* offset 80 — ASID context */
-	uint64_t sp_el0;         /* offset 88 — EL0 stack pointer */
-	uint64_t osdlr_el1;      /* offset 96 — OS Double Lock */
+	uint64_t tpidr_el0;      /* offset 64 — EL0 thread pointer */
+	uint64_t sp_el0;         /* offset 72 — EL0 stack pointer */
 };
 
 typedef struct __cpu_context _cpu_context_t;
