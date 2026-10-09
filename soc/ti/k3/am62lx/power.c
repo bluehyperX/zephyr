@@ -175,6 +175,15 @@ void pm_state_set(enum pm_state state, uint8_t substate_id)
 			 */
 			unsigned int key = arch_irq_lock();
 
+			/*
+			 * Whatever thread cpu1_pm_ctrl preempted (e.g. an
+			 * unpinned main) was requeued without an IPI, so CPU0
+			 * may be asleep in WFI and never pick it up while CPU1
+			 * is off.  Kick CPU0 so it runs the scheduler and takes
+			 * over every thread that is not pinned to CPU1.
+			 */
+			arch_sched_directed_ipi(BIT(0));
+
 			arch_flush_local_fpu();
 			(void)pm_cpu_off();
 			arch_irq_unlock(key);

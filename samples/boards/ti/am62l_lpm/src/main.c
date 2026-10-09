@@ -78,7 +78,7 @@ static int arm_rtc_alarm(void)
 	return ret;
 }
 
-/* CPU1 demo task: prints "I am alive" every 1s (busy-wait), forever.
+/* CPU1 demo task: prints "I am alive" every 1s (k_sleep), forever.
  * Pinned to CPU1 via SYS_INIT(APPLICATION) so it's ready before CPU1 boots.
  */
 K_THREAD_STACK_DEFINE(cpu1_task_stack, 4096);
@@ -91,16 +91,15 @@ static void cpu1_task(void *a, void *b, void *c)
 	ARG_UNUSED(c);
 
 	/*
-	 * Never sleeps: CPU1 is genuinely busy when CPU0 triggers S2RAM, so the
-	 * counter (a stack local, saved by the preemption that precedes CPU_OFF
-	 * and kept in retained DDR) continuing without a gap after resume shows
-	 * the running task was saved and restored.
+	 * Sleeps, so CPU1 goes idle between prints and the unpinned main thread
+	 * may be scheduled on CPU1 too. The counter (a stack local kept in
+	 * retained DDR) continuing after resume shows the task was restored.
 	 */
 	uint32_t n = 0;
 
 	while (1) {
 		printk("\r\nCPU1: I am alive (%u)\r\n", n++);
-		k_busy_wait(USEC_PER_SEC);
+		k_sleep(K_SECONDS(1));
 	}
 }
 
