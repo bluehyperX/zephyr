@@ -92,6 +92,21 @@ GEN_ABSOLUTE_SYM(__z_arm64_fp_context_sve_ffr_OFFSET,
 #endif
 #endif
 
+#ifdef CONFIG_PM_S2RAM
+#include <pm_s2ram_struct.h>
+
+GEN_OFFSET_SYM(_cpu_context_t, sp);
+GEN_OFFSET_SYM(_cpu_context_t, vbar_el1);
+GEN_OFFSET_SYM(_cpu_context_t, mair_el1);
+GEN_OFFSET_SYM(_cpu_context_t, tcr_el1);
+GEN_OFFSET_SYM(_cpu_context_t, ttbr0_el1);
+GEN_OFFSET_SYM(_cpu_context_t, sctlr_el1);
+GEN_OFFSET_SYM(_cpu_context_t, cpacr_el1);
+GEN_OFFSET_SYM(_cpu_context_t, tpidrro_el0);
+GEN_OFFSET_SYM(_cpu_context_t, tpidr_el0);
+GEN_OFFSET_SYM(_cpu_context_t, sp_el0);
+#endif /* CONFIG_PM_S2RAM */
+
 GEN_ABS_SYM_END
 
 #endif /* _ARM_OFFSETS_INC_ */

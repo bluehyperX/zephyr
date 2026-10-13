@@ -223,3 +223,7 @@
 	pinctrl-names = "default";
 	status = "okay";
 };
+
+&wkup_rtc0 {
+	status = "okay";
+};

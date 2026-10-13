@@ -63,6 +63,8 @@
 /* PSCI function ID is same for both 32 and 64 bit.*/
 #define PSCI_1_0_FN64_SYSTEM_RESET        PSCI_1_0_FN(9)
 #define PSCI_1_0_FN64_PSCI_FEATURES       PSCI_1_0_FN(10)
+#define PSCI_1_0_FN_SYSTEM_SUSPEND        PSCI_1_0_FN(14)
+#define PSCI_1_0_FN64_SYSTEM_SUSPEND      PSCI_1_0_FN64(14)
 
 /* PSCI v1.1 interface. */
 #define PSCI_1_1_FN_BASE                  (0x84000000U)

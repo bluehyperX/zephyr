@@ -58,6 +58,16 @@ typedef int (*pm_s2ram_system_off_fn_t)(void);
 int arch_pm_s2ram_suspend(pm_s2ram_system_off_fn_t system_off);
 
 /**
+ * @brief Resume entry point after suspend-to-RAM.
+ *
+ * Passed as the entry point to the firmware suspend call (e.g. PSCI
+ * SYSTEM_SUSPEND). Firmware branches here on wakeup with the CPU system
+ * registers at their reset values (EL2h on arm64). The function restores
+ * the context saved by @ref arch_pm_s2ram_suspend, which then returns 0.
+ */
+void arch_pm_s2ram_resume(void);
+
+/**
  * @brief Mark that core is entering suspend-to-RAM state.
  *
  * Function is called when system state is stored to RAM, just before going to system

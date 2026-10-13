@@ -50,6 +50,15 @@ struct arch_mem_domain {
 	sys_snode_t node;
 };
 
+/**
+ * @brief Prepare the calling CPU for being powered off
+ *
+ * Releases the FPU context owned by this CPU so that other CPUs do not wait
+ * for it. Must be called with interrupts locked, right before the CPU is
+ * powered off (e.g. with pm_cpu_off()).
+ */
+void arch_cpu_off_prepare(void);
+
 #endif /* _ASMLANGUAGE */
 
 #ifdef __cplusplus

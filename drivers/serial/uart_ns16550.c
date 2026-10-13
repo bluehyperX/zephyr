@@ -824,6 +824,20 @@ static int uart_ns16550_pm_action(const struct device *dev, enum pm_device_actio
 	case PM_DEVICE_ACTION_SUSPEND:
 		break;
 	case PM_DEVICE_ACTION_TURN_ON:
+		/*
+		 * Enable the clock before calling uart_ns16550_configure().
+		 * On TI K3 (CONFIG_UART_NS16550_TI_K3), configure() accesses
+		 * MDR1 before the internal clock_control_on() call, so the
+		 * functional clock must already be on or the register access
+		 * races against a gated clock.
+		 */
+		if (dev_cfg->clock_dev != NULL) {
+			ret = clock_control_on(dev_cfg->clock_dev,
+					       dev_cfg->clock_subsys);
+			if (ret != 0 && ret != -EALREADY && ret != -ENOSYS) {
+				return ret;
+			}
+		}
 		return uart_ns16550_configure(dev, uart_cfg);
 	case PM_DEVICE_ACTION_TURN_OFF:
 		if (dev_cfg->clock_dev != NULL) {

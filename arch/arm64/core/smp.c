@@ -62,6 +62,18 @@ static uint64_t cpu_map[CONFIG_MP_MAX_NUM_CPUS] = {
 	[0 ... (CONFIG_MP_MAX_NUM_CPUS - 1)] = INV_MPID
 };
 
+/* Publish the target MPID to the secondary core before pm_cpu_on(). */
+static void publish_boot_mpid(uint64_t mpid)
+{
+	barrier_dsync_fence_full();
+
+	/* store mpid last as this is our synchronization point */
+	arm64_cpu_boot_params.mpid = mpid;
+
+	sys_cache_data_flush_range((void *)&arm64_cpu_boot_params,
+				   sizeof(arm64_cpu_boot_params));
+}
+
 /* Called from Zephyr initialization */
 void arch_cpu_start(int cpu_num, k_thread_stack_t *stack, int sz,
 		    arch_cpustart_t fn, void *arg)
@@ -90,37 +102,42 @@ void arch_cpu_start(int cpu_num, k_thread_stack_t *stack, int sz,
 	arm64_cpu_boot_params.arg = arg;
 	arm64_cpu_boot_params.cpu_num = cpu_num;
 
-	for (; i < cpu_count; i++) {
-		if (cpu_node_list[i] == primary_core_mpid) {
-			continue;
-		}
-
-		cpu_mpid = cpu_node_list[i];
-
-		barrier_dsync_fence_full();
-
-		/* store mpid last as this is our synchronization point */
-		arm64_cpu_boot_params.mpid = cpu_mpid;
-
-		sys_cache_data_flush_range((void *)&arm64_cpu_boot_params,
-					  sizeof(arm64_cpu_boot_params));
-
+	/* Restart after S2RAM: the MPID is already known, skip the dts scan. */
+	if (cpu_map[cpu_num] != INV_MPID) {
+		cpu_mpid = cpu_map[cpu_num];
+		publish_boot_mpid(cpu_mpid);
 		if (pm_cpu_on(cpu_mpid, (uint64_t)&__start)) {
-			printk("Failed to boot secondary CPU core %d (MPID:%#llx)\n",
+			printk("Failed to resume secondary CPU core %d (MPID:%#llx)\n",
 			       cpu_num, cpu_mpid);
-#ifdef CONFIG_ARM64_FALLBACK_ON_RESERVED_CORES
-			printk("Falling back on reserved cores\n");
-			continue;
-#else
 			k_panic();
-#endif
 		}
+	} else {
+		for (; i < cpu_count; i++) {
+			if (cpu_node_list[i] == primary_core_mpid) {
+				continue;
+			}
 
-		break;
-	}
-	if (i++ == cpu_count) {
-		printk("Can't find CPU Core %d from dts and failed to boot it\n", cpu_num);
-		k_panic();
+			cpu_mpid = cpu_node_list[i];
+
+			publish_boot_mpid(cpu_mpid);
+
+			if (pm_cpu_on(cpu_mpid, (uint64_t)&__start)) {
+				printk("Failed to boot secondary CPU core %d (MPID:%#llx)\n",
+				       cpu_num, cpu_mpid);
+#ifdef CONFIG_ARM64_FALLBACK_ON_RESERVED_CORES
+				printk("Falling back on reserved cores\n");
+				continue;
+#else
+				k_panic();
+#endif
+			}
+
+			break;
+		}
+		if (i++ == cpu_count) {
+			printk("Can't find CPU Core %d from dts and failed to boot it\n", cpu_num);
+			k_panic();
+		}
 	}
 
 	/* Wait secondary cores up, see arch_secondary_cpu_init */
@@ -248,6 +265,13 @@ void z_arm64_mem_cfg_ipi(void)
 	send_ipi(SGI_MMCFG_IPI, IPI_ALL_CPUS_MASK);
 }
 #endif
+
+void arch_cpu_off_prepare(void)
+{
+#ifdef CONFIG_FPU_SHARING
+	arch_flush_local_fpu();
+#endif
+}
 
 #ifdef CONFIG_FPU_SHARING
 void flush_fpu_ipi_handler(const void *unused)

@@ -60,6 +60,7 @@
 		clock-frequency = <DT_FREQ_K(32)>;
 		clocks = <&scmi_clk 272>;
 		power-domains = <&wkup_rtc0_pd>;
+		wakeup-source;
 		status = "disabled";
 
 		counter_rtc0: counter_rtc {
